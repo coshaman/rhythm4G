@@ -95,6 +95,7 @@ def default_settings() -> dict[str, Any]:
             "6": ["s", "d", "f", "j", "k", "l"],
         },
         "special_keys": {"speed": "q", "echo": "w", "normal": "e"},
+        "control_keys": {"pause": "p", "retry": "backspace", "back": "escape"},
     }
 
 
@@ -110,12 +111,14 @@ def load_settings() -> dict[str, Any]:
                 base["gameplay_keys"][str(lane_count)] = normalize_key_names(list(keys))
             if isinstance(loaded.get("special_keys"), dict):
                 base["special_keys"].update({str(k): normalize_key_names([v])[0] for k, v in loaded["special_keys"].items()})
+            if isinstance(loaded.get("control_keys"), dict):
+                base["control_keys"].update({str(k): normalize_key_names([v])[0] for k, v in loaded["control_keys"].items()})
     except Exception:
         return base
     return base
 
 
-def save_settings(*, gameplay_keys: dict[str, list[str]] | None = None, special_keys: dict[str, str] | None = None) -> dict[str, Any]:
+def save_settings(*, gameplay_keys: dict[str, list[str]] | None = None, special_keys: dict[str, str] | None = None, control_keys: dict[str, str] | None = None) -> dict[str, Any]:
     data = load_settings()
     if gameplay_keys is not None:
         for lane_count, keys in gameplay_keys.items():
@@ -135,6 +138,18 @@ def save_settings(*, gameplay_keys: dict[str, list[str]] | None = None, special_
         if overlap:
             raise ValueError(f"특수키가 플레이 키와 겹칩니다: {', '.join(sorted(overlap))}")
         data["special_keys"] = normalized_special
+    if control_keys is not None:
+        normalized_control = {str(name): normalize_key_names([key])[0] for name, key in control_keys.items()}
+        if len(set(normalized_control.values())) != len(normalized_control):
+            raise ValueError("일시정지/리트라이/나가기 키는 서로 달라야 합니다.")
+        all_game = set()
+        for keys in data.get("gameplay_keys", {}).values():
+            all_game.update(keys)
+        reserved_fx = set(data.get("special_keys", {}).values())
+        overlap = (all_game | reserved_fx) & set(normalized_control.values())
+        if overlap:
+            raise ValueError(f"제어키가 플레이 키 또는 특수키와 겹칩니다: {', '.join(sorted(overlap))}")
+        data["control_keys"].update(normalized_control)
     settings_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return data
 
@@ -153,6 +168,11 @@ def gameplay_keys_for_lanes(lanes: int) -> list[str]:
 def special_keys_from_settings() -> dict[str, str]:
     settings = load_settings()
     return {str(k): str(v) for k, v in settings.get("special_keys", default_settings()["special_keys"]).items()}
+
+
+def control_keys_from_settings() -> dict[str, str]:
+    settings = load_settings()
+    return {str(k): str(v) for k, v in settings.get("control_keys", default_settings()["control_keys"]).items()}
 
 
 def safe_stem(path: Path) -> str:
@@ -296,8 +316,8 @@ def normalize_key_names(keys: list[str]) -> list[str]:
             continue
         if len(cleaned) == 1 and (cleaned.isalnum() or cleaned in "-=[];\',./"):
             out.append(cleaned)
-        elif cleaned in {"space", "tab", "left", "right", "up", "down"}:
-            out.append(cleaned)
+        elif cleaned in {"space", "tab", "left", "right", "up", "down", "escape", "backspace", "delete", "enter", "return", "pause"}:
+            out.append("enter" if cleaned == "return" else cleaned)
         else:
             raise ValueError(f"Unsupported key name: {k}")
     if len(out) != len(set(out)):
@@ -334,4 +354,9 @@ def patch_chart_settings(chart_path: str | Path, *, offset_ms: int | None = None
             raw_original = float(note.get("raw_scroll_speed", raw) or raw)
             note["raw_scroll_speed"] = round(raw_original, 2)
             note["scroll_speed"] = round(raw_original * speed_multiplier, 2)
+        for marker in data.get("grid_markers", []):
+            raw = float(marker.get("scroll_speed", original_base) or original_base)
+            raw_original = float(marker.get("raw_scroll_speed", raw) or raw)
+            marker["raw_scroll_speed"] = round(raw_original, 2)
+            marker["scroll_speed"] = round(raw_original * speed_multiplier, 2)
     chart_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

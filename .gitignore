@@ -1,64 +1,8 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.pyo
-*.pyd
-.Python
-
-# Virtual environments
 .venv/
-venv/
-env/
-ENV/
-conda-meta/
-
-# Build artifacts
+__pycache__/
+*.pyc
 build/
 dist/
 release/
-*.egg-info/
-*.spec.bak
-
-# PyInstaller
-*.manifest
-*.log
-
-# Executables / installers
-*.exe
-*.msi
-*.zip
-*.7z
-*.rar
-
-# Rhythm4G generated/runtime files
-music/
-charts/
-records.json
-settings.json
 .rhythmforge_cache/
-
-# Audio files
-*.mp3
-*.wav
-*.ogg
-*.flac
-*.m4a
-*.aac
-
-# Large media / generated cache
-*.npy
-*.npz
-*.pkl
-*.pickle
-
-# OS / editor
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-
-# Test/cache
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+records.json

@@ -10,6 +10,7 @@ from typing import Any
 import librosa
 import numpy as np
 
+from .chart_utils import normalize_chord_visuals
 from .config import DIFFICULTIES
 from .library import charts_dir, portable_path
 
@@ -157,6 +158,76 @@ def _local_bpm_at(t: float, beat_times: np.ndarray, global_tempo: float) -> floa
         return float(global_tempo or 120.0)
     return float(60.0 / np.median(intervals))
 
+
+
+def _grid_scroll_speed_at(
+    t: float,
+    *,
+    beat_times: np.ndarray,
+    tempo: float,
+    base_speed: float,
+    rms_norm: np.ndarray,
+    onset_norm: np.ndarray,
+    highlight_curve: np.ndarray,
+    highlight_threshold: float,
+    sr: int,
+    hop_length: int,
+) -> float:
+    """Use the same local-speed model for grid lines and nearby notes."""
+    if len(onset_norm) == 0:
+        return float(base_speed)
+    frame_i = int(np.clip(librosa.time_to_frames(float(t), sr=sr, hop_length=hop_length), 0, len(onset_norm) - 1))
+    energy = _feature_at(rms_norm, min(frame_i, max(0, len(rms_norm) - 1)))
+    local_bpm = _local_bpm_at(float(t), beat_times, tempo)
+    is_highlight = bool(highlight_curve.size and highlight_curve[frame_i] >= highlight_threshold and energy >= 0.54)
+    speed = base_speed * np.clip(0.90 + 0.20 * (local_bpm / max(tempo, 1.0)) + 0.13 * energy + (0.10 if is_highlight else 0.0), 0.86, 1.35)
+    return float(speed)
+
+
+def _build_grid_markers(
+    grid: np.ndarray,
+    *,
+    beat_times: np.ndarray,
+    tempo: float,
+    base_speed: float,
+    rms_norm: np.ndarray,
+    onset_norm: np.ndarray,
+    highlight_curve: np.ndarray,
+    highlight_threshold: float,
+    sr: int,
+    hop_length: int,
+    duration: float,
+) -> list[dict[str, Any]]:
+    if grid.size == 0:
+        return []
+    beat_interval = float(np.median(np.diff(beat_times))) if len(beat_times) >= 2 else 60.0 / max(tempo, 1.0)
+    markers: list[dict[str, Any]] = []
+    for t in grid[(grid >= 0) & (grid <= duration)][:8000]:
+        tt = float(t)
+        strong = False
+        if beat_times.size:
+            idx = int(np.searchsorted(beat_times, tt))
+            near = beat_times[max(0, idx - 1): min(len(beat_times), idx + 2)]
+            strong = bool(near.size and float(np.min(np.abs(near - tt))) <= max(0.012, beat_interval * 0.035))
+        speed = _grid_scroll_speed_at(
+            tt,
+            beat_times=beat_times,
+            tempo=tempo,
+            base_speed=base_speed,
+            rms_norm=rms_norm,
+            onset_norm=onset_norm,
+            highlight_curve=highlight_curve,
+            highlight_threshold=highlight_threshold,
+            sr=sr,
+            hop_length=hop_length,
+        )
+        markers.append({
+            "time": round(tt, 4),
+            "scroll_speed": round(speed, 2),
+            "raw_scroll_speed": round(speed, 2),
+            "strong": strong,
+        })
+    return markers
 
 def _lane_from_features(
     lanes: int,
@@ -690,15 +761,37 @@ def analyze_audio(audio_path: str | Path, difficulty: str = "hard", output: str 
         _snap_chord_clusters(notes, window=0.034 if difficulty in {"normal", "hard"} else 0.042)
         notes = _dedupe_and_limit(notes, lanes, float(cfg["max_notes_per_second"]))
 
+    # Lock clean multi-lane chords to one visual timing/speed/color before
+    # persisting.  This prevents 3+ note chords from looking uneven because one
+    # lane inherited a slightly different local scroll speed.
+    notes = normalize_chord_visuals(
+        notes,
+        chord_window=0.034 if difficulty in {"normal", "hard"} else 0.042,
+    )
+
     # Strip internal salience from the persisted chart after sorting.
     for n in notes:
         n.pop("salience", None)
     notes.sort(key=lambda n: (float(n["time"]), int(n["lane"])))
 
+    grid_markers = _build_grid_markers(
+        grid,
+        beat_times=beat_times,
+        tempo=tempo,
+        base_speed=base_speed,
+        rms_norm=rms_norm,
+        onset_norm=onset_norm,
+        highlight_curve=highlight_curve,
+        highlight_threshold=highlight_threshold,
+        sr=sr,
+        hop_length=hop_length,
+        duration=duration,
+    )
+
     chart_id = f"{_song_id(audio_path)}:{difficulty}:{len(notes)}"
 
     chart = {
-        "version": 6,
+        "version": 8,
         "chart_id": chart_id,
         "song_id": _song_id(audio_path),
         "title": audio_path.stem,
@@ -711,6 +804,7 @@ def analyze_audio(audio_path: str | Path, difficulty: str = "hard", output: str 
         "tempo_bpm": round(tempo, 3),
         "beat_interval": round(float(beat_interval), 5),
         "grid_times": [round(float(x), 4) for x in grid[(grid >= 0) & (grid <= duration)]][:8000],
+        "grid_markers": grid_markers,
         "lanes": lanes,
         "keys": cfg["keys"],
         "special_keys": {"speed": "q", "echo": "w", "normal": "e"},
@@ -723,10 +817,10 @@ def analyze_audio(audio_path: str | Path, difficulty: str = "hard", output: str 
         "note_count": len(notes),
         "generator": {
             "name": "Rhythm4G autocharter",
-            "version": 6,
+            "version": 8,
             "developer": "집돌이 페렐만",
             "tempo_correction": tempo_correction,
-            "timing": "hybrid onset timing with half/double BPM correction and motif-based rhythm-game patterns",
+            "timing": "hybrid onset timing with half/double BPM correction, motif patterns, chord clustering, per-grid visual speed markers, and locked chord visuals",
             "density": "aggressive difficulty presets with accent chords, streams, stairs, trills, and jacks",
         },
         "notes": notes,

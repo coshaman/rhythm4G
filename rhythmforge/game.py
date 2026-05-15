@@ -10,28 +10,38 @@ from time import perf_counter
 
 import pygame
 
+from .chart_utils import normalize_chord_visuals
 from .config import DEFAULT_SPECIAL_KEYS, JUDGEMENTS, MISS_MS
 from .effects import EffectFiles, prepare_effect_files
-from .library import gameplay_keys_for_lanes, record_for_chart, resolve_portable_path, special_keys_from_settings, update_record
+from .library import control_keys_from_settings, gameplay_keys_for_lanes, record_for_chart, resolve_portable_path, special_keys_from_settings, update_record
 
 
 NOTE_COLORS = {
-    "normal": ((92, 171, 255), (224, 242, 255)),
-    "bright": ((126, 203, 255), (235, 249, 255)),
-    "accent": ((178, 136, 255), (242, 232, 255)),
-    "highlight": ((255, 190, 96), (255, 244, 210)),
+    "normal": ((98, 185, 255), (229, 246, 255)),
+    "bright": ((255, 214, 116), (255, 246, 205)),
+    "accent": ((202, 143, 255), (246, 232, 255)),
+    "highlight": ((255, 116, 151), (255, 228, 236)),
 }
+# Key beams/press feedback intentionally use neutral blue-white colors instead of
+# note colors.  This keeps stacked notes readable when hit effects overlap them.
 LANE_FLASH_COLORS = {
-    "normal": (56, 78, 112),
-    "bright": (60, 92, 122),
-    "accent": (80, 65, 124),
-    "highlight": (120, 86, 45),
+    "normal": (42, 54, 82),
+    "bright": (46, 61, 88),
+    "accent": (50, 57, 92),
+    "highlight": (56, 61, 92),
 }
 SPECIAL_LABELS = {
     "normal": "NORMAL",
     "speed": "RUSH x1.15",
     "echo": "ECHO",
 }
+
+
+@dataclass
+class GridMarker:
+    time: float
+    scroll_speed: float
+    strong: bool = False
 
 
 @dataclass
@@ -77,22 +87,51 @@ class RhythmGame:
         special.update(special_keys_from_settings())
         self.special_keys = special
         self.special_key_to_mode = self._build_special_key_map(special)
+        self.control_keys = control_keys_from_settings()
+        self.control_key_to_action = self._build_control_key_map(self.control_keys)
 
         base_speed = float(self.chart.get("base_scroll_speed", self.chart.get("scroll_speed", 720)))
+        # Runtime compatibility pass: old v7 charts may already contain exact
+        # chord timestamps, but their visual speed/color/raw_time can still differ
+        # per lane.  Normalize before RuntimeNote creation so existing charts do
+        # not need to be regenerated.
+        chart_notes = normalize_chord_visuals(
+            [dict(n) for n in self.chart.get("notes", [])],
+            chord_window=0.034 if self.chart.get("difficulty") in {"normal", "hard"} else 0.042,
+        )
         self.notes = [
             RuntimeNote(
-                time=float(n["time"]),
-                raw_time=float(n.get("raw_time", n["time"])),
+                time=float(n.get("render_time", n.get("time", 0.0))),
+                raw_time=float(n.get("raw_time", n.get("time", 0.0))),
                 grid_locked=bool(n.get("grid_locked", True)),
                 lane=int(n["lane"]),
-                scroll_speed=float(n.get("scroll_speed", base_speed)),
+                scroll_speed=float(n.get("visual_scroll_speed", n.get("scroll_speed", base_speed))),
                 color=str(n.get("color", "normal")),
                 source=str(n.get("source", "unknown")),
             )
-            for n in self.chart["notes"]
+            for n in chart_notes
         ]
         self.notes.sort(key=lambda n: (n.time, n.lane))
-        self.grid_times = [float(x) for x in self.chart.get("grid_times", [])]
+        base_grid_speed = float(self.chart.get("scroll_speed", self.chart.get("base_scroll_speed", 720)))
+        self.grid_markers: list[GridMarker] = []
+        for i, g in enumerate(self.chart.get("grid_markers", [])):
+            try:
+                self.grid_markers.append(GridMarker(
+                    time=float(g.get("time", 0.0)),
+                    scroll_speed=float(g.get("scroll_speed", base_grid_speed)),
+                    strong=bool(g.get("strong", False)),
+                ))
+            except Exception:
+                continue
+        if not self.grid_markers:
+            beat_interval = max(float(self.chart.get("beat_interval", 0.5) or 0.5), 0.001)
+            for x in self.chart.get("grid_times", []):
+                t = float(x)
+                strong = abs((t / beat_interval) - round(t / beat_interval)) < 0.02
+                nearby = [n.scroll_speed for n in self.notes if abs(n.time - t) <= max(0.08, beat_interval * 0.20)]
+                speed = float(sum(nearby) / len(nearby)) if nearby else base_grid_speed
+                self.grid_markers.append(GridMarker(time=t, scroll_speed=speed, strong=strong))
+        self.grid_markers.sort(key=lambda g: g.time)
         self.offset = float(self.chart.get("offset_ms", 0)) / 1000.0
         self.record = record_for_chart(self.chart)
 
@@ -132,10 +171,27 @@ class RhythmGame:
         self.effect_started_at = 0.0
         self.effect_message_until = 0.0
         self.effect_message = ""
+        self.paused = False
+        self.paused_at = 0.0
+        self.paused_song_time = 0.0
 
     def _key_code(self, name: str) -> int:
         name = str(name).strip().lower()
-        aliases = {"space": pygame.K_SPACE, "tab": pygame.K_TAB, "left": pygame.K_LEFT, "right": pygame.K_RIGHT, "up": pygame.K_UP, "down": pygame.K_DOWN}
+        aliases = {
+            "space": pygame.K_SPACE,
+            "tab": pygame.K_TAB,
+            "left": pygame.K_LEFT,
+            "right": pygame.K_RIGHT,
+            "up": pygame.K_UP,
+            "down": pygame.K_DOWN,
+            "escape": pygame.K_ESCAPE,
+            "esc": pygame.K_ESCAPE,
+            "backspace": pygame.K_BACKSPACE,
+            "delete": pygame.K_DELETE,
+            "enter": pygame.K_RETURN,
+            "return": pygame.K_RETURN,
+            "pause": pygame.K_PAUSE,
+        }
         if name in aliases:
             return aliases[name]
         return pygame.key.key_code(name)
@@ -162,7 +218,23 @@ class RhythmGame:
                 out[code] = mode
         return out
 
+    def _build_control_key_map(self, control: dict[str, str]) -> dict[int, str]:
+        out: dict[int, str] = {}
+        for action in ("pause", "retry", "back"):
+            key = control.get(action)
+            if not key:
+                continue
+            try:
+                code = self._key_code(key)
+            except Exception:
+                continue
+            if code not in self.key_to_lane and code not in self.special_key_to_mode:
+                out[code] = action
+        return out
+
     def song_time(self) -> float:
+        if self.paused:
+            return self.paused_song_time
         if self.music_started and pygame.mixer.get_init() is not None:
             pos_ms = pygame.mixer.music.get_pos()
             if pos_ms >= 0:
@@ -181,6 +253,49 @@ class RhythmGame:
                 print("[WARN] Gameplay will run without audio. Check your Windows sound output device.")
                 return False
         return True
+
+    def _make_font(self, size: int, *, bold: bool = False) -> pygame.font.Font:
+        """Create a CJK-capable font for Korean/Japanese/Chinese titles."""
+        # pygame.font.match_font is inconsistent for TTC CJK fonts on Windows,
+        # so try common font files first, then system font names.
+        candidates = [
+            r"C:\Windows\Fonts\msyh.ttc",        # Microsoft YaHei, zh + kana
+            r"C:\Windows\Fonts\msyhbd.ttc",
+            r"C:\Windows\Fonts\meiryo.ttc",      # Japanese
+            r"C:\Windows\Fonts\meiryob.ttc",
+            r"C:\Windows\Fonts\YuGothR.ttc",
+            r"C:\Windows\Fonts\YuGothB.ttc",
+            r"C:\Windows\Fonts\msgothic.ttc",
+            r"C:\Windows\Fonts\malgun.ttf",      # Korean
+            r"C:\Windows\Fonts\malgunbd.ttf",
+            r"C:\Windows\Fonts\simsun.ttc",      # Simplified Chinese
+            r"C:\Windows\Fonts\mingliu.ttc",     # Traditional Chinese
+        ]
+        if bold:
+            candidates = [p for p in candidates if "bd" in p.lower() or "bold" in p.lower()] + candidates
+        for candidate in candidates:
+            path = Path(candidate)
+            if path.exists():
+                try:
+                    return pygame.font.Font(str(path), size)
+                except Exception:
+                    pass
+
+        preferred = [
+            "microsoftyahei", "microsoft yahei", "microsoftjhenghei", "microsoft jhenghei",
+            "meiryo", "yugothic", "yu gothic", "msgothic", "ms gothic",
+            "malgungothic", "malgun gothic", "notosanscjk", "noto sans cjk",
+            "notosanscjkkr", "notosanscjkJP", "notosanscjkSC", "notosanscjkTC",
+            "notosanskr", "nanumgothic", "applegothic", "arialunicode", "segoeui", "consolas",
+        ]
+        for name in preferred:
+            path = pygame.font.match_font(name, bold=bold)
+            if path:
+                try:
+                    return pygame.font.Font(path, size)
+                except Exception:
+                    pass
+        return pygame.font.SysFont(None, size, bold=bold)
 
     def _prepare_effects_async(self) -> None:
         def worker() -> None:
@@ -224,6 +339,33 @@ class RhythmGame:
         except pygame.error as exc:
             print(f"[WARN] Could not switch music effect: {exc}")
 
+    def toggle_pause(self, st: float) -> None:
+        now = perf_counter()
+        if not self.paused:
+            self.paused = True
+            self.paused_at = now
+            self.paused_song_time = st
+            if self.audio_enabled and self.music_started:
+                pygame.mixer.music.pause()
+            self.effect_message = "PAUSED"
+            self.effect_message_until = now + 999999.0
+            return
+
+        paused_duration = now - self.paused_at
+        self.paused = False
+        self.started_at += paused_duration
+        self.effect_started_at += paused_duration
+        if self.audio_enabled and self.music_started:
+            pygame.mixer.music.unpause()
+        self.effect_message = "RESUME"
+        self.effect_message_until = now + 0.6
+
+    def restart(self) -> None:
+        if self.audio_enabled:
+            pygame.mixer.music.stop()
+        self.__init__(self.chart_path)
+        self.run()
+
     def switch_effect(self, mode: str, st: float) -> None:
         if not self.audio_enabled:
             return
@@ -240,9 +382,9 @@ class RhythmGame:
         pygame.display.set_caption("Rhythm4G")
         screen = pygame.display.set_mode((self.width, self.height))
         clock = pygame.time.Clock()
-        font_big = pygame.font.SysFont("consolas", 42, bold=True)
-        font_mid = pygame.font.SysFont("consolas", 26, bold=True)
-        font_small = pygame.font.SysFont("consolas", 18)
+        font_big = self._make_font(42, bold=True)
+        font_mid = self._make_font(26, bold=True)
+        font_small = self._make_font(18)
 
         if self.audio_enabled:
             self._prepare_effects_async()
@@ -260,20 +402,21 @@ class RhythmGame:
                 if event.type == pygame.QUIT:
                     self.running = False
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
+                    action = self.control_key_to_action.get(event.key)
+                    if action == "back":
                         self.running = False
-                    elif event.key == pygame.K_r:
-                        if self.audio_enabled:
-                            pygame.mixer.music.stop()
-                        self.__init__(self.chart_path)
-                        return self.run()
-                    elif event.key in self.special_key_to_mode:
+                    elif action == "retry":
+                        return self.restart()
+                    elif action == "pause":
+                        self.toggle_pause(st)
+                    elif not self.paused and event.key in self.special_key_to_mode:
                         self.switch_effect(self.special_key_to_mode[event.key], st)
-                    elif event.key in self.key_to_lane:
+                    elif not self.paused and event.key in self.key_to_lane:
                         self.handle_hit(self.key_to_lane[event.key], st)
 
-            self.update_misses(st)
-            self.maybe_save_record(st)
+            if not self.paused:
+                self.update_misses(st)
+                self.maybe_save_record(st)
             self.draw(screen, font_big, font_mid, font_small, st)
             pygame.display.flip()
             clock.tick(240)
@@ -311,9 +454,9 @@ class RhythmGame:
                 note.judgement = judge.name
                 self.judge_counts[judge.name] += 1
                 self.hit_count += 1
-                self.score += judge.score + min(self.combo, 500) * 3
                 self.combo += 1
                 self.max_combo = max(self.max_combo, self.combo)
+                self.recalculate_score()
                 self.show_judgement(judge.name)
                 self.flash_lane(lane, note.color)
                 self.hit_bursts.append(HitBurst(lane=lane, created_at=perf_counter(), color=note.color, judgement=judge.name))
@@ -328,12 +471,23 @@ class RhythmGame:
         note.missed = True
         note.judgement = "MISS"
         self.judge_counts["MISS"] += 1
+        self.recalculate_score()
         self.break_combo("MISS")
 
     def update_misses(self, st: float) -> None:
         for note in self.notes:
             if not note.hit and not note.missed and (st - note.time) * 1000.0 > MISS_MS:
                 self.mark_miss(note)
+
+    def recalculate_score(self) -> None:
+        total = len(self.notes)
+        if total <= 0:
+            self.score = 0
+            return
+        perfect_value = float(JUDGEMENTS[0].score)
+        judgement_score = sum(self.judge_counts[j.name] * j.score for j in JUDGEMENTS)
+        self.score = int(round(1_000_000 * judgement_score / (total * perfect_value)))
+        self.score = max(0, min(1_000_000, self.score))
 
     def accuracy(self) -> float:
         total = len(self.notes)
@@ -374,24 +528,27 @@ class RhythmGame:
         self.show_judgement(text)
 
     def draw_grid(self, screen: pygame.Surface, st: float) -> None:
-        if not self.grid_times:
+        if not self.grid_markers:
             return
         left = self.board_x - 18
         right = self.width - self.board_x + 18
-        # Draw grey beat/subbeat guide lines near visible notes.  The actual chart
-        # may contain non-grid notes, so these are visual timing references only.
+        field_top = 214
+        field_bottom = self.height - 104
+        # Grid markers now carry their own scroll speed.  This makes the grey
+        # timing lines travel with the same local speed bucket used by nearby
+        # notes instead of the old global chart speed.
         min_t = st - 0.25
-        max_t = st + 2.8
-        for gt in self.grid_times:
+        max_t = st + 3.2
+        for marker in self.grid_markers:
+            gt = marker.time
             if gt < min_t:
                 continue
             if gt > max_t:
                 break
-            y = self.hit_y - (gt - st) * float(self.chart.get("scroll_speed", self.chart.get("base_scroll_speed", 720)))
-            if 90 <= y <= self.height - 92:
-                strong = abs((gt / max(float(self.chart.get("beat_interval", 0.5)), 0.001)) - round(gt / max(float(self.chart.get("beat_interval", 0.5)), 0.001))) < 0.02
-                color = (84, 88, 104) if strong else (56, 60, 74)
-                width = 2 if strong else 1
+            y = self.hit_y - (gt - st) * marker.scroll_speed
+            if field_top <= y <= field_bottom:
+                color = (84, 88, 104) if marker.strong else (56, 60, 74)
+                width = 2 if marker.strong else 1
                 pygame.draw.line(screen, color, (left, int(y)), (right, int(y)), width)
 
     def draw_rounded_panel(self, screen: pygame.Surface, rect: pygame.Rect, fill: tuple[int, int, int], outline: tuple[int, int, int] | None = None) -> None:
@@ -409,11 +566,13 @@ class RhythmGame:
             x = self.board_x + burst.lane * (self.lane_w + self.lane_gap) + self.lane_w // 2
             t = age / 0.34
             radius = int(18 + 38 * t)
-            body, outline = NOTE_COLORS.get(burst.color, NOTE_COLORS["normal"])
             alpha_like = max(0, 1.0 - t)
-            # pygame without alpha compositing on the main surface: draw thin rings.
-            pygame.draw.circle(screen, outline, (x, self.hit_y), radius, max(1, int(4 * alpha_like)))
-            pygame.draw.circle(screen, body, (x, self.hit_y), max(4, int(10 * (1 - t))), 0)
+            # Neutral key-beam effect.  Do not reuse note colors; otherwise dense
+            # chords and hit bursts blend into each other.
+            ring = (226, 238, 255)
+            core = (145, 190, 255)
+            pygame.draw.circle(screen, ring, (x, self.hit_y), radius, max(1, int(3 * alpha_like)))
+            pygame.draw.circle(screen, core, (x, self.hit_y), max(3, int(7 * (1 - t))), 0)
         self.hit_bursts = alive
 
     def draw_result_overlay(self, screen: pygame.Surface, font_big, font_mid, font_small) -> None:
@@ -447,7 +606,7 @@ class RhythmGame:
         judge_line = "   ".join(f"{k} {v}" for k, v in self.judge_counts.items())
         jt = font_small.render(judge_line, True, (190, 199, 222))
         screen.blit(jt, jt.get_rect(center=(panel.centerx, panel.bottom - 80)))
-        hint = font_mid.render("R Retry    ESC Back to launcher", True, (255, 255, 255))
+        hint = font_mid.render(f"{self.control_keys.get('retry','backspace').upper()} Retry    {self.control_keys.get('back','escape').upper()} Back", True, (255, 255, 255))
         screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.bottom - 38)))
 
     def draw(self, screen, font_big, font_mid, font_small, st: float) -> None:
@@ -468,7 +627,8 @@ class RhythmGame:
         screen.blit(font_small.render(title, True, (235, 239, 255)), (38, 28))
         screen.blit(font_small.render(f"BPM {bpm}   Notes {count}   Offset {int(self.offset * 1000)}ms   {best}", True, (154, 166, 198)), (38, 52))
         fx_hint = f"FX {SPECIAL_LABELS.get(self.effect_mode, self.effect_mode)}   {self.special_keys.get('speed','q').upper()} Rush / {self.special_keys.get('echo','w').upper()} Echo / {self.special_keys.get('normal','e').upper()} Normal"
-        screen.blit(font_small.render(fx_hint, True, (154, 166, 198)), (38, 76))
+        control_hint = f"{self.control_keys.get('pause','p').upper()} Pause / {self.control_keys.get('retry','backspace').upper()} Retry / {self.control_keys.get('back','escape').upper()} Back"
+        screen.blit(font_small.render(fx_hint + "    " + control_hint, True, (154, 166, 198)), (38, 76))
 
         # Large, persistent combo/score HUD. Combo now stays readable even during dense sections.
         combo_color = (255, 255, 255) if self.combo < 50 else (255, 226, 146)
@@ -477,7 +637,7 @@ class RhythmGame:
         if combo_scale > 1.01:
             combo_surface = pygame.transform.smoothscale(combo_surface, (int(combo_surface.get_width() * combo_scale), int(combo_surface.get_height() * combo_scale)))
         screen.blit(combo_surface, combo_surface.get_rect(center=(self.width // 2, 142)))
-        score_surface = font_mid.render(f"SCORE {self.score:,}     ACC {self.accuracy():.2f}%", True, (198, 209, 238))
+        score_surface = font_mid.render(f"SCORE {self.score:07,d} / 1,000,000     ACC {self.accuracy():.2f}%", True, (198, 209, 238))
         screen.blit(score_surface, score_surface.get_rect(center=(self.width // 2, 184)))
 
         # No countdown text is drawn over the playfield.  Earlier versions showed
@@ -510,15 +670,19 @@ class RhythmGame:
                 continue
             dt = note.time - st
             y = self.hit_y - dt * note.scroll_speed
-            if st < -0.05 or y < 104 or y > self.height + 50:
+            # Do not draw notes above the lane columns.  Earlier versions let
+            # notes appear in the header area before entering the vertical lanes.
+            if st < -0.05 or y < 214 or y > self.height + 50:
                 continue
             x = self.board_x + note.lane * (self.lane_w + self.lane_gap)
             body, outline = NOTE_COLORS.get(note.color, NOTE_COLORS["normal"])
-            visual_pulse = 1.0 + 0.045 * math.sin(now * 18 + note.lane)
-            w = int(self.lane_w * 0.84 * visual_pulse)
-            h = 24 if note.color != "highlight" else 29
+            # Chord bodies must be geometrically identical across lanes.
+            # Do not vary body width/height by lane, time pulse, or color; put
+            # emphasis only in the external glow.
+            w = int(self.lane_w * 0.84)
+            h = 26
             note_rect = pygame.Rect(0, 0, w, h)
-            note_rect.center = (x + self.lane_w // 2, int(y))
+            note_rect.center = (x + self.lane_w // 2, int(round(y)))
             if note.color in {"accent", "highlight"}:
                 glow = note_rect.inflate(16, 12)
                 pygame.draw.rect(screen, body, glow, width=2, border_radius=14)
@@ -549,8 +713,20 @@ class RhythmGame:
             pygame.draw.rect(screen, (35, 41, 61), (28, self.height - 68, self.width - 56, 10), border_radius=5)
             pygame.draw.rect(screen, (125, 181, 255), (28, self.height - 68, int((self.width - 56) * progress), 10), border_radius=5)
         counts = "  ".join(f"{k}:{v}" for k, v in self.judge_counts.items() if v)
-        footer = f"Hit {hit}/{total}   Max {self.max_combo}x   {counts}   ESC Back   R Retry"
+        footer = f"Hit {hit}/{total}   Max {self.max_combo}x   {counts}   {self.control_keys.get('back','escape').upper()} Back   {self.control_keys.get('retry','backspace').upper()} Retry   {self.control_keys.get('pause','p').upper()} Pause"
         screen.blit(font_small.render(footer, True, (158, 170, 202)), (28, self.height - 42))
+
+        if self.paused and not self.finished:
+            overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 120))
+            screen.blit(overlay, (0, 0))
+            panel = pygame.Rect(0, 0, min(520, self.width - 120), 190)
+            panel.center = (self.width // 2, self.height // 2)
+            self.draw_rounded_panel(screen, panel, (24, 29, 48), (100, 120, 170))
+            pt = font_big.render("PAUSED", True, (255, 255, 255))
+            screen.blit(pt, pt.get_rect(center=(panel.centerx, panel.top + 62)))
+            hint = font_mid.render(f"{self.control_keys.get('pause','p').upper()} Resume", True, (210, 224, 255))
+            screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.top + 124)))
 
         if self.finished:
             self.draw_result_overlay(screen, font_big, font_mid, font_small)

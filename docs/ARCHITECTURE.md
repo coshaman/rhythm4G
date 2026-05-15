@@ -1,74 +1,112 @@
-# RhythmForge Architecture v4
+# Rhythm4G Architecture v8
 
-## Modules
+## Entry points
 
-```text
-rhythmforge/
-  main.py        CLI/UI entrypoint
-  launcher.py    Tkinter desktop launcher
-  chartgen.py    audio analysis and chart generation
-  game.py        pygame-ce gameplay loop
-  effects.py     cached speed/echo audio variant generator
-  library.py     portable paths, chart list, settings patch, records
-  config.py      difficulty presets and judgement windows
-```
+- `run_rhythmforge.py`: launcher entry point for source mode and PyInstaller.
+- `rhythmforge.main`: CLI entry point. Supports `app`, `auto`, and `play`.
+
+## Core modules
+
+- `chartgen.py`
+  - Loads audio with librosa.
+  - Extracts onset strength, beat frames, RMS, chroma, and spectral centroid.
+  - Applies half/double BPM correction and accepts a manual BPM override from CLI/launcher.
+  - Clusters near-simultaneous multi-lane notes so natural chords descend exactly together.
+  - Generates hybrid timing charts: strong rhythmic hits snap to grid, weaker melodic hits may remain non-grid.
+  - Adds rhythm-game motifs such as stairs, trills, jacks, and accent chords.
+
+- `game.py`
+  - Pygame-ce game loop.
+  - Uses global key settings from `settings.json`, not chart-local key settings.
+  - Handles independent lane judgement for simultaneous notes.
+  - Draws beat/subbeat grid lines, large combo HUD, hit bursts, lane flashes, progress bar, and result overlay.
+  - Saves records through `library.update_record`.
+
+- `launcher.py`
+  - Tkinter launcher UI.
+  - Imports audio to `music/`.
+  - Runs chart analysis in a background thread.
+  - Lists charts from `charts/`.
+  - Saves global key settings to `settings.json`.
+  - Saves chart-local offset and note speed multiplier to chart JSON.
+
+- `library.py`
+  - Portable path helpers.
+  - Audio import and chart discovery.
+  - `records.json` persistence.
+  - `settings.json` persistence.
+
+- `effects.py`
+  - Creates cached Rush/Echo audio variants in `.rhythmforge_cache/`.
 
 ## Portable data model
 
-`library.project_root()` is the only root resolver.
+The app root is:
 
-- Source mode: current working directory
-- PyInstaller mode: directory containing `RhythmForge.exe`
+- source mode: current working directory
+- PyInstaller mode: directory containing `Rhythm4G.exe`
 
-Runtime data is stored relative to that root:
+Generated files are stored relative to this root:
 
 ```text
 music/
 charts/
 records.json
+settings.json
 .rhythmforge_cache/
 ```
 
-Generated charts store `audio_path` as a relative path whenever possible.
+Chart audio paths are stored as portable relative paths where possible, for example:
 
-## Chart generation
+```json
+"audio_path": "music/song.mp3"
+```
 
-`chartgen.analyze_audio()` uses:
+## Settings model
 
-- `librosa.load()` for decoding
-- onset envelope for attack detection
-- beat tracking for grid reference
-- RMS energy for highlight detection
-- chroma/spectral centroid for lane assignment
+Key settings are no longer stored per chart. They are stored in `settings.json`:
 
-Timing is hybrid:
+```json
+{
+  "gameplay_keys": {
+    "4": ["d", "f", "j", "k"],
+    "6": ["s", "d", "f", "j", "k", "l"]
+  },
+  "special_keys": {
+    "speed": "q",
+    "echo": "w",
+    "normal": "e"
+  }
+}
+```
 
-- Strong rhythmic hits snap to the beat/subbeat grid.
-- Loose melodic hits keep non-grid raw timing.
-- Each note stores `time`, `raw_time`, and `grid_locked`.
+## Chart-local settings
 
-## Gameplay
+The following remain chart-local because they can vary by song/chart:
 
-`game.RhythmGame` loads chart JSON, resolves the audio path, and builds runtime notes.
+- `offset_ms`
+- `ui_speed_multiplier`
+- per-note `scroll_speed`
 
-Important systems:
 
-- 240 FPS event/render loop for lower input quantization
-- lane-wise nearest-note judgement for dense chords
-- score/combo/accuracy tracking
-- grey grid rendering from `grid_times`
-- record save through `library.update_record()`
-- special FX stream switching through `effects.prepare_effect_files()`
 
-## Special effects
+## v8 timing/rendering note
 
-pygame mixer does not provide real-time MP3 DSP. v4 creates cached WAV variants:
+Charts now include `grid_markers` with per-marker `scroll_speed` values. The game renderer uses these markers so grey grid lines move with the same local speed model as nearby notes. Older charts without `grid_markers` still fall back to `grid_times` and the chart-level scroll speed.
 
-- speed: librosa time-stretch, default rate 1.15
-- echo: delayed/attenuated audio layers
+Korean and other non-ASCII titles are stored with UTF-8 JSON (`ensure_ascii=False`) and rendered using Korean-capable system fonts when available.
 
-The game switches the current music stream while preserving the estimated song position.
 
-## Records
+## v8 Chord Visual Normalization
 
-`records.json` is keyed by `chart_id`. Each entry stores high score, best combo, best accuracy, and last play stats.
+`rhythmforge/chart_utils.py` normalizes clean multi-lane chord groups so simultaneous notes share one render time, one visual scroll speed, and one visual color. The game applies the same pass at load time, so older v7 chart JSON files are corrected without regeneration. Note body geometry is fixed per lane; highlight/accent notes use external glow only.
+
+## v9 변경사항
+
+- 일본어/중국어 곡 제목 표시를 위해 런처와 플레이 화면의 CJK 폰트 탐색을 강화했습니다. JSON 저장은 UTF-8/`ensure_ascii=False`를 유지합니다.
+- 노트 색상과 키빔/타격 이펙트 색상을 분리했습니다. 노트는 파랑/노랑/보라/분홍 계열, 키빔은 중립적인 청백색 계열을 사용하여 겹치는 상황의 가시성을 높였습니다.
+- 리트라이 키를 `R` 고정에서 전역 설정으로 변경했습니다. 기본값은 `Backspace`이며 런처에서 바꿀 수 있습니다.
+- 일시정지 키를 추가했습니다. 기본값은 `P`이며 런처에서 바꿀 수 있습니다.
+- 뒤로가기 키도 전역 제어키로 관리합니다. 기본값은 `Escape`입니다.
+- 점수 체계를 1,000,000점 고정 만점으로 변경했습니다. 전부 PERFECT이면 정확히 1,000,000점입니다.
+

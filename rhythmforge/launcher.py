@@ -6,12 +6,12 @@ import threading
 import traceback
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from .chartgen import analyze_audio
 from .config import DEFAULT_SPECIAL_KEYS, DIFFICULTIES
 from .game import play_chart
-from .library import ChartInfo, charts_dir, gameplay_keys_for_lanes, import_audio, list_charts, normalize_key_names, patch_chart_settings, records_path, save_settings, settings_path, special_keys_from_settings
+from .library import ChartInfo, charts_dir, control_keys_from_settings, gameplay_keys_for_lanes, import_audio, list_charts, normalize_key_names, patch_chart_settings, records_path, save_settings, settings_path, special_keys_from_settings
 
 
 class Rhythm4GLauncher(tk.Tk):
@@ -37,6 +37,10 @@ class Rhythm4GLauncher(tk.Tk):
         self.speed_key_var = tk.StringVar(value=special.get("speed", DEFAULT_SPECIAL_KEYS["speed"]))
         self.echo_key_var = tk.StringVar(value=special.get("echo", DEFAULT_SPECIAL_KEYS["echo"]))
         self.normal_key_var = tk.StringVar(value=special.get("normal", DEFAULT_SPECIAL_KEYS["normal"]))
+        control = control_keys_from_settings()
+        self.pause_key_var = tk.StringVar(value=control.get("pause", "p"))
+        self.retry_key_var = tk.StringVar(value=control.get("retry", "backspace"))
+        self.back_key_var = tk.StringVar(value=control.get("back", "escape"))
         self.audio_label_var = tk.StringVar(value="아직 선택된 음악 파일이 없습니다.")
         self.status_var = tk.StringVar(value="MP3를 불러오거나 기존 채보를 선택하세요.")
 
@@ -46,20 +50,35 @@ class Rhythm4GLauncher(tk.Tk):
         self.refresh_chart_list()
         self.after(120, self._poll_status_queue)
 
+    def _ui_font(self) -> str:
+        # Prefer fonts that display Korean/Japanese/Chinese titles in Tk widgets.
+        available = {name.lower(): name for name in tkfont.families(self)}
+        for candidate in (
+            "Microsoft YaHei UI", "Microsoft YaHei", "Meiryo UI", "Meiryo",
+            "Yu Gothic UI", "Yu Gothic", "Malgun Gothic", "Microsoft JhengHei UI",
+            "Microsoft JhengHei", "Noto Sans CJK KR", "Noto Sans CJK JP",
+            "Noto Sans CJK SC", "Segoe UI",
+        ):
+            if candidate.lower() in available:
+                return available[candidate.lower()]
+        return "TkDefaultFont"
+
     def _build_style(self) -> None:
         style = ttk.Style(self)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
+        ui_font = self._ui_font()
+        self.option_add("*Font", (ui_font, 10))
         style.configure("TFrame", background="#111522")
         style.configure("Panel.TFrame", background="#181d2f", relief="flat")
-        style.configure("TLabel", background="#111522", foreground="#e8ebf7", font=("Segoe UI", 10))
-        style.configure("Panel.TLabel", background="#181d2f", foreground="#e8ebf7", font=("Segoe UI", 10))
-        style.configure("Muted.TLabel", background="#181d2f", foreground="#a8b0ca", font=("Segoe UI", 9))
-        style.configure("Title.TLabel", background="#111522", foreground="#ffffff", font=("Segoe UI", 24, "bold"))
-        style.configure("Section.TLabel", background="#181d2f", foreground="#ffffff", font=("Segoe UI", 14, "bold"))
-        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        style.configure("TLabel", background="#111522", foreground="#e8ebf7", font=(ui_font, 10))
+        style.configure("Panel.TLabel", background="#181d2f", foreground="#e8ebf7", font=(ui_font, 10))
+        style.configure("Muted.TLabel", background="#181d2f", foreground="#a8b0ca", font=(ui_font, 9))
+        style.configure("Title.TLabel", background="#111522", foreground="#ffffff", font=(ui_font, 24, "bold"))
+        style.configure("Section.TLabel", background="#181d2f", foreground="#ffffff", font=(ui_font, 14, "bold"))
+        style.configure("Accent.TButton", font=(ui_font, 10, "bold"))
         style.configure("TRadiobutton", background="#181d2f", foreground="#e8ebf7")
         style.configure("TCheckbutton", background="#181d2f", foreground="#e8ebf7")
         style.configure("TScale", background="#181d2f")
@@ -127,8 +146,15 @@ class Rhythm4GLauncher(tk.Tk):
         fx_row.grid(row=2, column=1, sticky="ew", pady=(12, 5))
         for label, var in [("Speed", self.speed_key_var), ("Echo", self.echo_key_var), ("Normal", self.normal_key_var)]:
             ttk.Label(fx_row, text=label, style="Panel.TLabel").pack(side="left", padx=(0, 4))
-            ttk.Entry(fx_row, textvariable=var, width=4).pack(side="left", padx=(0, 12))
-        ttk.Button(key_frame, text="전역 키 설정 저장", command=self.save_global_key_settings).grid(row=3, column=1, sticky="ew", pady=(10, 0))
+            ttk.Entry(fx_row, textvariable=var, width=8).pack(side="left", padx=(0, 12))
+        ttk.Label(key_frame, text="전역 제어키", style="Panel.TLabel").grid(row=3, column=0, sticky="w", pady=(12, 5))
+        control_row = ttk.Frame(key_frame, style="Panel.TFrame")
+        control_row.grid(row=3, column=1, sticky="ew", pady=(12, 5))
+        for label, var in [("Pause", self.pause_key_var), ("Retry", self.retry_key_var), ("Back", self.back_key_var)]:
+            ttk.Label(control_row, text=label, style="Panel.TLabel").pack(side="left", padx=(0, 4))
+            ttk.Entry(control_row, textvariable=var, width=10).pack(side="left", padx=(0, 12))
+        ttk.Label(key_frame, text="기본값: Pause=P, Retry=Backspace, Back=Escape. 플레이 키/특수키와 겹치면 저장되지 않습니다.", style="Muted.TLabel").grid(row=4, column=1, sticky="w")
+        ttk.Button(key_frame, text="전역 키 설정 저장", command=self.save_global_key_settings).grid(row=5, column=1, sticky="ew", pady=(10, 0))
 
         ttk.Checkbutton(left, text="분석 완료 후 바로 플레이", variable=self.auto_play_var).pack(anchor="w", pady=(8, 16))
         self.analyze_button = ttk.Button(left, text="분석해서 채보 만들기", command=self.analyze_selected_audio, style="Accent.TButton")
@@ -153,7 +179,7 @@ class Rhythm4GLauncher(tk.Tk):
             borderwidth=0,
             highlightthickness=1,
             highlightbackground="#2c334a",
-            font=("Consolas", 10),
+            font=(self._ui_font(), 10),
         )
         self.chart_list.grid(row=0, column=0, sticky="nsew")
         self.chart_list.bind("<<ListboxSelect>>", self.on_chart_selected)
@@ -192,6 +218,16 @@ class Rhythm4GLauncher(tk.Tk):
             raise ValueError("특수키끼리도 서로 달라야 합니다.")
         return special
 
+    def parse_control_keys(self) -> dict[str, str]:
+        control = {
+            "pause": normalize_key_names([self.pause_key_var.get()])[0],
+            "retry": normalize_key_names([self.retry_key_var.get()])[0],
+            "back": normalize_key_names([self.back_key_var.get()])[0],
+        }
+        if len(set(control.values())) != len(control):
+            raise ValueError("제어키끼리도 서로 달라야 합니다.")
+        return control
+
     def lane_count_for_current_difficulty(self) -> int:
         cfg = DIFFICULTIES.get(self.difficulty_var.get(), DIFFICULTIES["normal"])
         return int(cfg["lanes"])
@@ -206,9 +242,12 @@ class Rhythm4GLauncher(tk.Tk):
             if len(keys) != lanes:
                 raise ValueError(f"현재 난이도는 {lanes}키 채보를 생성하므로 정확히 {lanes}개의 플레이 키가 필요합니다.")
             special_keys = self.parse_special_keys()
+            control_keys = self.parse_control_keys()
             if set(keys) & set(special_keys.values()):
                 raise ValueError("플레이 키와 특수키가 겹치면 안 됩니다.")
-            save_settings(gameplay_keys={str(lanes): keys}, special_keys=special_keys)
+            if (set(keys) | set(special_keys.values())) & set(control_keys.values()):
+                raise ValueError("제어키가 플레이 키 또는 특수키와 겹치면 안 됩니다.")
+            save_settings(gameplay_keys={str(lanes): keys}, special_keys=special_keys, control_keys=control_keys)
             self.status_var.set(f"전역 키 설정을 저장했습니다. ({lanes}키: {' '.join(keys)})")
         except Exception as exc:
             messagebox.showerror("전역 키 설정 저장 실패", str(exc))
@@ -241,9 +280,12 @@ class Rhythm4GLauncher(tk.Tk):
             if len(keys) != lanes:
                 raise ValueError(f"현재 난이도는 {lanes}키 채보를 생성하므로 정확히 {lanes}개의 플레이 키가 필요합니다.")
             special_keys = self.parse_special_keys()
+            control_keys = self.parse_control_keys()
             if set(keys) & set(special_keys.values()):
                 raise ValueError("플레이 키와 특수키가 겹치면 안 됩니다.")
-            save_settings(gameplay_keys={str(lanes): keys}, special_keys=special_keys)
+            if (set(keys) | set(special_keys.values())) & set(control_keys.values()):
+                raise ValueError("제어키가 플레이 키 또는 특수키와 겹치면 안 됩니다.")
+            save_settings(gameplay_keys={str(lanes): keys}, special_keys=special_keys, control_keys=control_keys)
         except Exception as exc:
             messagebox.showerror("키 설정 오류", str(exc))
             return
@@ -322,6 +364,10 @@ class Rhythm4GLauncher(tk.Tk):
             self.speed_key_var.set(str(special.get("speed", DEFAULT_SPECIAL_KEYS["speed"])))
             self.echo_key_var.set(str(special.get("echo", DEFAULT_SPECIAL_KEYS["echo"])))
             self.normal_key_var.set(str(special.get("normal", DEFAULT_SPECIAL_KEYS["normal"])))
+            control = control_keys_from_settings()
+            self.pause_key_var.set(str(control.get("pause", "p")))
+            self.retry_key_var.set(str(control.get("retry", "backspace")))
+            self.back_key_var.set(str(control.get("back", "escape")))
         except Exception:
             self.speed_var.set(1.0)
         self.status_var.set(f"선택됨: {info.title} [{info.difficulty}]")
@@ -337,9 +383,12 @@ class Rhythm4GLauncher(tk.Tk):
             if len(keys) != lanes:
                 raise ValueError(f"현재 난이도는 {lanes}키 채보를 생성하므로 정확히 {lanes}개의 플레이 키가 필요합니다.")
             special_keys = self.parse_special_keys()
+            control_keys = self.parse_control_keys()
             if set(keys) & set(special_keys.values()):
                 raise ValueError("플레이 키와 특수키가 겹치면 안 됩니다.")
-            save_settings(gameplay_keys={str(lanes): keys}, special_keys=special_keys)
+            if (set(keys) | set(special_keys.values())) & set(control_keys.values()):
+                raise ValueError("제어키가 플레이 키 또는 특수키와 겹치면 안 됩니다.")
+            save_settings(gameplay_keys={str(lanes): keys}, special_keys=special_keys, control_keys=control_keys)
             patch_chart_settings(info.path, offset_ms=int(self.offset_var.get()), speed_multiplier=float(self.speed_var.get()))
             self.refresh_chart_list()
             self.status_var.set("선택한 채보 설정을 저장했습니다.")
