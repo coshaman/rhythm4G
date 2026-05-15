@@ -10,7 +10,7 @@ from time import perf_counter
 
 import pygame
 
-from .chart_utils import normalize_chord_visuals
+from .chart_utils import normalize_chord_visuals, suppress_notes_inside_holds
 from .config import DEFAULT_SPECIAL_KEYS, JUDGEMENTS, MISS_MS
 from .effects import EffectFiles, prepare_effect_files
 from .library import control_keys_from_settings, gameplay_keys_for_lanes, record_for_chart, resolve_portable_path, special_keys_from_settings, update_record
@@ -59,6 +59,10 @@ class RuntimeNote:
     remaining_hits: int = 0
     active: bool = False
     hold_judgement: str | None = None
+    hold_started: bool = False
+    hold_broken: bool = False
+    next_hold_tick: float = 0.0
+    hold_ticks_scored: int = 0
     hit: bool = False
     missed: bool = False
     judgement: str | None = None
@@ -113,8 +117,12 @@ class RhythmGame:
         # chord timestamps, but their visual speed/color/raw_time can still differ
         # per lane.  Normalize before RuntimeNote creation so existing charts do
         # not need to be regenerated.
+        chart_notes = [dict(n) for n in self.chart.get("notes", [])]
+        # Runtime compatibility/safety pass: even older generated charts should
+        # never show taps/chords/rolls on top of a long note.
+        chart_notes = suppress_notes_inside_holds(chart_notes, pad_before=0.12, pad_after=0.18)
         chart_notes = normalize_chord_visuals(
-            [dict(n) for n in self.chart.get("notes", [])],
+            chart_notes,
             chord_window=0.034 if self.chart.get("difficulty") in {"normal", "hard"} else 0.042,
         )
         self.notes = [
@@ -128,12 +136,15 @@ class RhythmGame:
                 source=str(n.get("source", "unknown")),
                 note_type=str(n.get("type", "tap")),
                 end_time=float(n.get("end_time", n.get("time", 0.0))) if n.get("end_time") is not None else None,
-                required_hits=int(n.get("required_hits", 0) or 0),
-                remaining_hits=int(n.get("required_hits", 0) or 0),
+                required_hits=max(15, int(n.get("required_hits", 0) or 0)) if str(n.get("type", "tap")) == "roll" else int(n.get("required_hits", 0) or 0),
+                remaining_hits=max(15, int(n.get("required_hits", 0) or 0)) if str(n.get("type", "tap")) == "roll" else int(n.get("required_hits", 0) or 0),
             )
             for n in chart_notes
         ]
         self.notes.sort(key=lambda n: (n.time, n.lane))
+        beat_interval_for_ticks = max(float(self.chart.get("beat_interval", 0.5) or 0.5), 0.001)
+        self.hold_tick_interval = float(max(0.18, min(0.36, beat_interval_for_ticks / 2.0)))
+        self.total_score_units = self._compute_total_score_units()
         base_grid_speed = float(self.chart.get("scroll_speed", self.chart.get("base_scroll_speed", 720)))
         self.grid_markers: list[GridMarker] = []
         for i, g in enumerate(self.chart.get("grid_markers", [])):
@@ -600,10 +611,32 @@ class RhythmGame:
             return None
         return min(candidates, key=lambda n: abs(max(n.time, min(st, n.end_time or n.time)) - st))
 
-    def _apply_judgement(self, note: RuntimeNote, judge_name: str, *, combo: bool = True) -> None:
-        note.hit = True
-        note.active = False
-        note.judgement = judge_name
+    def _compute_total_score_units(self) -> int:
+        """Return the fixed denominator for 1,000,000 scoring.
+
+        Tap and roll notes count as one scoring unit. Hold notes count as a
+        head, periodic sustain ticks, and a tail.
+        """
+        total = 0
+        for n in self.notes:
+            if n.note_type == "hold" and n.end_time is not None:
+                duration = max(0.0, float(n.end_time) - float(n.time))
+                sustain_ticks = max(1, int(duration / self.hold_tick_interval))
+                total += 2 + sustain_ticks
+            else:
+                total += 1
+        return max(1, total)
+
+    def _add_score_judgement(
+        self,
+        judge_name: str,
+        *,
+        combo: bool = True,
+        lane: int | None = None,
+        color: str = "normal",
+        burst: bool = False,
+    ) -> None:
+        """Add one scoring/combo unit, including hold sustain ticks."""
         self.judge_counts[judge_name] += 1
         self.hit_count += 1
         if combo and judge_name != "BAD":
@@ -613,10 +646,23 @@ class RhythmGame:
             self.combo = 0
         self.recalculate_score()
         self.show_judgement(judge_name)
-        if 0 <= note.lane < self.lanes:
-            self.flash_lane(note.lane, note.color)
-            self.hit_bursts.append(HitBurst(lane=note.lane, created_at=perf_counter(), color=note.color, judgement=judge_name))
+        if burst and lane is not None and 0 <= lane < self.lanes:
+            self.flash_lane(lane, color)
+            self.hit_bursts.append(HitBurst(lane=lane, created_at=perf_counter(), color=color, judgement=judge_name))
         self.last_hit_at = perf_counter()
+
+    def _apply_judgement(self, note: RuntimeNote, judge_name: str, *, combo: bool = True) -> None:
+        note.hit = True
+        note.active = False
+        note.judgement = judge_name
+        self._add_score_judgement(
+            judge_name,
+            combo=combo,
+            lane=note.lane if 0 <= note.lane < self.lanes else None,
+            color=note.color,
+            burst=0 <= note.lane < self.lanes,
+        )
+
 
     def _judgement_for_delta(self, delta_ms: float) -> str | None:
         for judge in JUDGEMENTS:
@@ -625,24 +671,29 @@ class RhythmGame:
         return None
 
     def start_hold(self, note: RuntimeNote, lane: int, st: float, judge_name: str | None = None) -> None:
-        """Start a hold note without consuming it as a tap.
+        """Start a Project Sekai-like hold note.
 
-        A hold scores only when it survives until end_time.  This method exists
-        separately from _apply_judgement so holding a key is represented as a
-        sustained active state, not as one instant key press.
+        The head is judged immediately, sustain ticks add combo while held, and
+        the tail is judged at end_time. The visual note stays on screen until
+        the tail passes even after an early release.
         """
-        if note.hit or note.missed or note.active:
+        if note.hit or note.missed or note.active or note.hold_broken:
             return
         note.active = True
+        note.hold_started = True
         note.hold_judgement = judge_name or self._judgement_for_delta(abs(note.time - st) * 1000.0) or "GOOD"
-        self.show_judgement("HOLD")
-        self.flash_lane(lane, note.color)
-        self.hit_bursts.append(HitBurst(lane=lane, created_at=perf_counter(), color=note.color, judgement=note.hold_judgement))
-        self.last_hit_at = perf_counter()
+        note.next_hold_tick = note.time + self.hold_tick_interval
+        self._add_score_judgement(note.hold_judgement, combo=True, lane=lane, color=note.color, burst=True)
+
 
     def handle_hit(self, lane: int, st: float) -> None:
         now = perf_counter()
         if 0 <= lane < len(self.lane_down):
+            # Ignore repeated KEYDOWN events while the same physical key is held.
+            # This prevents holding a key from draining roll notes or mashing
+            # through taps without distinct presses.
+            if self.lane_down[lane]:
+                return
             self.lane_down[lane] = True
 
         note = self.find_candidate(lane, st)
@@ -660,8 +711,8 @@ class RhythmGame:
             return
 
         # Roll notes intentionally accept any gameplay key, but only during their
-        # visible active span.  They are generated in sections without other
-        # lane notes, so normal taps/holds always have priority above this.
+        # visible active span. They require distinct key presses; held keys are
+        # ignored by the repeat guard above.
         roll = self.active_roll_candidate(st)
         if roll is not None:
             roll.active = True
@@ -676,9 +727,6 @@ class RhythmGame:
 
         early = self.find_early_mash_target(lane, st)
         if early is not None:
-            # Anti-mash behavior: if the player is repeatedly pressing while a
-            # note is approaching but not yet judgeable, consume that note as BAD
-            # instead of allowing spam to eventually auto-hit it.
             early.hit = True
             early.judgement = "BAD"
             self.judge_counts["BAD"] += 1
@@ -695,10 +743,15 @@ class RhythmGame:
             self.flash_lane(lane, "normal")
             self.lane_empty_cooldown_until[lane] = now + 0.06
 
+
     def finish_hold(self, note: RuntimeNote, judgement: str | None = None) -> None:
         if note.hit or note.missed:
             return
-        self._apply_judgement(note, judgement or note.hold_judgement or "GOOD", combo=True)
+        note.active = False
+        note.hit = True
+        note.judgement = judgement or note.hold_judgement or "GOOD"
+        self._add_score_judgement(note.judgement, combo=True, lane=note.lane, color=note.color, burst=True)
+
 
     def handle_key_up(self, lane: int, st: float) -> None:
         if 0 <= lane < len(self.lane_down):
@@ -710,8 +763,14 @@ class RhythmGame:
             if st >= end - 0.08:
                 self.finish_hold(note, note.hold_judgement or "GOOD")
             else:
-                self.mark_miss(note)
+                # Early release breaks combo immediately but does not delete the
+                # visible hold object. It keeps falling until the tail passes.
+                note.active = False
+                note.hold_broken = True
+                note.judgement = "RELEASE"
+                self.break_combo("RELEASE")
             return
+
 
     def mark_miss(self, note: RuntimeNote) -> None:
         if note.hit or note.missed:
@@ -733,16 +792,24 @@ class RhythmGame:
             if note.note_type == "hold":
                 end = note.end_time or note.time
                 if note.active:
-                    # Long key press support: as long as the physical lane key is
-                    # still down, automatically finish at the tail.
-                    if 0 <= note.lane < len(self.lane_down) and self.lane_down[note.lane] and st >= end - 0.01:
-                        self.finish_hold(note, note.hold_judgement or "GOOD")
-                    elif st > end + miss_window:
+                    if 0 <= note.lane < len(self.lane_down) and self.lane_down[note.lane]:
+                        tick_limit = min(st, end - 0.05)
+                        while note.next_hold_tick and note.next_hold_tick <= tick_limit:
+                            note.hold_ticks_scored += 1
+                            note.next_hold_tick += self.hold_tick_interval
+                            self._add_score_judgement("PERFECT", combo=True, lane=note.lane, color=note.color, burst=False)
+                        if st >= end - 0.01:
+                            self.finish_hold(note, note.hold_judgement or "GOOD")
+                    else:
+                        # Focus loss / missed KEYUP safety path.
+                        note.active = False
+                        note.hold_broken = True
+                        note.judgement = "RELEASE"
+                        self.break_combo("RELEASE")
+                elif note.hold_broken:
+                    if st > end + miss_window:
                         self.mark_miss(note)
                 else:
-                    # If the key was already held as the head enters the judge
-                    # window, start the hold. This makes sustained KEYDOWN state
-                    # matter, rather than requiring repeated keydown events.
                     if 0 <= note.lane < len(self.lane_down) and self.lane_down[note.lane]:
                         delta_ms = abs(note.time - st) * 1000.0
                         judge_name = self._judgement_for_delta(delta_ms)
@@ -762,8 +829,9 @@ class RhythmGame:
             if st - note.time > miss_window:
                 self.mark_miss(note)
 
+
     def recalculate_score(self) -> None:
-        total = len(self.notes)
+        total = int(getattr(self, "total_score_units", len(self.notes)))
         if total <= 0:
             self.score = 0
             return
@@ -773,7 +841,7 @@ class RhythmGame:
         self.score = max(0, min(1_000_000, self.score))
 
     def accuracy(self) -> float:
-        total = len(self.notes)
+        total = int(getattr(self, "total_score_units", len(self.notes)))
         if total <= 0:
             return 0.0
         max_score = total * JUDGEMENTS[0].score
@@ -791,7 +859,7 @@ class RhythmGame:
                 max_combo=self.max_combo,
                 accuracy=self.accuracy(),
                 hit_count=self.hit_count,
-                total_notes=len(self.notes),
+                total_notes=int(getattr(self, "total_score_units", len(self.notes))),
             )
             self.record_saved = True
             self.finished = True
@@ -938,7 +1006,7 @@ class RhythmGame:
                 hold_w = int(self.lane_w * 0.44)
                 hold_rect = pygame.Rect(0, visible_top, hold_w, max(8, visible_bottom - visible_top))
                 hold_rect.centerx = center_x
-                fill = (54, 72, 112) if not note.active else (72, 96, 148)
+                fill = (86, 48, 60) if note.hold_broken else ((54, 72, 112) if not note.active else (72, 96, 148))
                 pygame.draw.rect(screen, fill, hold_rect, border_radius=12)
                 pygame.draw.rect(screen, outline, hold_rect, width=2, border_radius=12)
 
@@ -1049,7 +1117,7 @@ class RhythmGame:
             screen.blit(et, et.get_rect(center=(self.width // 2, 216)))
 
         hit = sum(1 for n in self.notes if n.hit)
-        total = len(self.notes)
+        total = int(getattr(self, "total_score_units", len(self.notes)))
         duration = float(self.chart.get("duration", 0.0) or 0.0)
         if duration > 0:
             progress = max(0.0, min(1.0, st / duration))

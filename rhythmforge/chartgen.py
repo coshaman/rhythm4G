@@ -10,7 +10,7 @@ from typing import Any
 import librosa
 import numpy as np
 
-from .chart_utils import normalize_chord_visuals
+from .chart_utils import normalize_chord_visuals, suppress_notes_inside_holds
 from .config import DIFFICULTIES
 from .library import charts_dir, portable_path
 
@@ -455,12 +455,12 @@ def _add_hold_and_roll_notes(
 ) -> None:
     """Add playable hold notes and visible roll notes.
 
-    v14 changes:
+    v15 changes:
     - Hold notes are now deliberately longer and are placed by clearing the
       selected lane during the hold span.  This avoids impossible same-lane
       taps inside a sustain.
-    - Rolls are less rare and have a fallback pass, so players can actually see
-      the mechanic in typical songs while still keeping them special.
+    - Rolls last longer, require at least 15 distinct presses, and appear in
+      high-density sections often enough to test the mechanic.
     """
     if len(beat_times) < 4 or duration < 18:
         return
@@ -495,8 +495,8 @@ def _add_hold_and_roll_notes(
 
     # 1) Hold notes: longer, readable sustains.  Instead of requiring an empty
     # lane beforehand, choose a good calm span and remove same-lane taps inside.
-    hold_limits = {"normal": 2, "hard": 3, "extreme": 4, "master": 5}
-    hold_beats = {"normal": 3.0, "hard": 3.0, "extreme": 3.5, "master": 4.0}
+    hold_limits = {"normal": 2, "hard": 3, "extreme": 5, "master": 6}
+    hold_beats = {"normal": 3.5, "hard": 4.0, "extreme": 4.5, "master": 5.0}
     max_holds = hold_limits.get(difficulty, 3)
     hold_candidates: list[tuple[float, float, float, int, float, str]] = []
 
@@ -507,9 +507,9 @@ def _add_hold_and_roll_notes(
         if start < 3.0 or start > duration - 5.0:
             continue
         dur = beat_interval * hold_beats.get(difficulty, 3.0)
-        dur = float(np.clip(dur, 1.25, 3.40 if difficulty != "master" else 4.20))
+        dur = float(np.clip(dur, 1.60, 4.60 if difficulty != "master" else 5.40))
         end = min(duration - 0.45, start + dur)
-        if end - start < 1.15:
+        if end - start < 1.45:
             continue
         onset_avg, onset_peak, energy_avg, high_ratio = stats(start, end)
         # Prefer sustained musical sections.  Allow moderate highlight ratio, but
@@ -530,7 +530,7 @@ def _add_hold_and_roll_notes(
     for _score, start, end, lane, speed, color in hold_candidates:
         if placed_holds >= max_holds:
             break
-        if overlaps_interval(start, end, protected_intervals, pad=1.10):
+        if overlaps_interval(start, end, protected_intervals, pad=0.85):
             continue
         # Clear this lane during the sustain. Other lanes may still have notes,
         # but the held lane must stay readable/playable.
@@ -549,7 +549,7 @@ def _add_hold_and_roll_notes(
             "grid_locked": True,
             "lane": int(lane),
             "type": "hold",
-            "source": "sustain-hold-v14",
+            "source": "sustain-hold-v15",
             "strength": round(float(_score), 4),
             "energy": round(float(_score), 4),
             "local_bpm": round(float(_local_bpm_at(start, beat_times, tempo)), 3),
@@ -564,7 +564,7 @@ def _add_hold_and_roll_notes(
     # 2) Roll notes: visible but still special.  Use local transient density; if
     # a song has no very obvious bursts, place one or two best fallback rolls on
     # high-energy spans so the mechanic can be tested.
-    roll_limits = {"normal": 1, "hard": 2, "extreme": 3, "master": 4}
+    roll_limits = {"normal": 1, "hard": 2, "extreme": 4, "master": 5}
     max_rolls = roll_limits.get(difficulty, 2)
     if max_rolls <= 0:
         return
@@ -575,18 +575,18 @@ def _add_hold_and_roll_notes(
         start = float(beat_times[bi])
         if start < 6.0 or start > duration - 6.0:
             continue
-        span_beats = {"normal": 1.0, "hard": 1.25, "extreme": 1.5, "master": 1.75}.get(difficulty, 1.25)
+        span_beats = {"normal": 1.50, "hard": 1.75, "extreme": 2.00, "master": 2.25}.get(difficulty, 1.75)
         end = min(duration - 0.6, start + beat_interval * span_beats)
-        if end - start < 0.55:
+        if end - start < 0.85:
             continue
         onset_avg, onset_peak, energy_avg, high_ratio = stats(start, end)
         burst_score = 0.44 * onset_avg + 0.28 * onset_peak + 0.18 * energy_avg + 0.10 * high_ratio
-        threshold = {"normal": 0.34, "hard": 0.30, "extreme": 0.26, "master": 0.23}.get(difficulty, 0.30)
+        threshold = {"normal": 0.31, "hard": 0.27, "extreme": 0.23, "master": 0.20}.get(difficulty, 0.27)
         if burst_score < threshold:
             continue
-        if overlaps_interval(start, end, protected_intervals, pad=1.10):
+        if overlaps_interval(start, end, protected_intervals, pad=0.85):
             continue
-        required = int(np.clip(round((end - start) * {"normal": 4.5, "hard": 5.5, "extreme": 7.0, "master": 8.5}.get(difficulty, 6.0)), 3, 18))
+        required = int(np.clip(round((end - start) * {"normal": 10.0, "hard": 11.0, "extreme": 12.5, "master": 14.0}.get(difficulty, 11.0)), 15, 36))
         speed = base_speed * np.clip(1.03 + 0.12 * energy_avg + 0.08 * high_ratio, 0.96, 1.30)
         roll_candidates.append((burst_score, start, end, required, speed))
 
@@ -598,12 +598,12 @@ def _add_hold_and_roll_notes(
             start = float(beat_times[bi])
             if start < 8.0 or start > duration - 8.0:
                 continue
-            end = min(duration - 0.6, start + beat_interval * 1.15)
-            if overlaps_interval(start, end, protected_intervals, pad=1.10):
+            end = min(duration - 0.6, start + beat_interval * {"normal": 1.45, "hard": 1.65, "extreme": 1.90, "master": 2.10}.get(difficulty, 1.65))
+            if overlaps_interval(start, end, protected_intervals, pad=0.85):
                 continue
             onset_avg, onset_peak, energy_avg, high_ratio = stats(start, end)
             score = 0.36 * onset_avg + 0.24 * onset_peak + 0.28 * energy_avg + 0.12 * high_ratio
-            required = int(np.clip(round((end - start) * {"normal": 4.0, "hard": 5.0, "extreme": 6.5, "master": 8.0}.get(difficulty, 5.0)), 3, 15))
+            required = int(np.clip(round((end - start) * {"normal": 9.5, "hard": 10.5, "extreme": 12.0, "master": 13.5}.get(difficulty, 10.5)), 15, 34))
             speed = base_speed * np.clip(1.00 + 0.10 * energy_avg + 0.06 * high_ratio, 0.94, 1.24)
             fallback.append((score, start, end, required, speed))
         fallback.sort(reverse=True, key=lambda x: x[0])
@@ -630,8 +630,8 @@ def _add_hold_and_roll_notes(
             "grid_locked": True,
             "lane": -1,
             "type": "roll",
-            "required_hits": int(required),
-            "source": "burst-roll-v14",
+            "required_hits": max(15, int(required)),
+            "source": "burst-roll-v15",
             "strength": round(float(score), 4),
             "energy": round(float(score), 4),
             "local_bpm": round(float(_local_bpm_at(start, beat_times, tempo)), 3),
@@ -957,8 +957,14 @@ def analyze_audio(audio_path: str | Path, difficulty: str = "hard", output: str 
         seed=seed,
     )
 
+    # Hold lanes are reserved gameplay space.  Run this after special-note
+    # insertion and again after density-fill, because later passes can otherwise
+    # reintroduce taps on top of a long note.
+    notes = suppress_notes_inside_holds(notes, pad_before=0.12, pad_after=0.18)
+
     _snap_chord_clusters(notes, window=0.034 if difficulty in {"normal", "hard"} else 0.042)
     notes = _dedupe_and_limit(notes, lanes, float(cfg["max_notes_per_second"]))
+    notes = suppress_notes_inside_holds(notes, pad_before=0.12, pad_after=0.18)
 
     # If a quiet song is still too empty, force a minimum chart density using the
     # beat grid.  This prevents hard/extreme/master from all feeling easy.
@@ -990,6 +996,11 @@ def analyze_audio(audio_path: str | Path, difficulty: str = "hard", output: str 
                 break
         _snap_chord_clusters(notes, window=0.034 if difficulty in {"normal", "hard"} else 0.042)
         notes = _dedupe_and_limit(notes, lanes, float(cfg["max_notes_per_second"]))
+        notes = suppress_notes_inside_holds(notes, pad_before=0.12, pad_after=0.18)
+
+    # Final safety pass: no tap/chord/jack/roll can overlap a hold lane or
+    # contradict a hold interval in the persisted chart.
+    notes = suppress_notes_inside_holds(notes, pad_before=0.12, pad_after=0.18)
 
     # Lock clean multi-lane chords to one visual timing/speed/color before
     # persisting.  This prevents 3+ note chords from looking uneven because one

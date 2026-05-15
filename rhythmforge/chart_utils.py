@@ -101,3 +101,75 @@ def normalize_chord_visuals(
         i = j
 
     return ordered
+
+
+def suppress_notes_inside_holds(
+    notes: list[dict[str, Any]],
+    *,
+    pad_before: float = 0.10,
+    pad_after: float = 0.14,
+    remove_roll_overlap: bool = True,
+) -> list[dict[str, Any]]:
+    """Remove notes that visually/gameplay-overlap long notes.
+
+    In Rhythm4G, a hold lane must be completely reserved from the hold head
+    through its tail.  A tap/jack/chord on top of a hold is unreadable and
+    impossible to play cleanly, especially after density-fill or chord-pattern
+    passes run after hold placement.
+
+    Rules:
+    - Keep hold notes.
+    - Remove all non-hold notes on the same lane whose time is inside the hold
+      interval, including a small visual pad before/after the sustain.
+    - Remove roll notes if their active interval intersects a hold.  Roll notes
+      are any-key mash sections, so overlapping them with a hold creates
+      contradictory input.
+    """
+    if not notes:
+        return notes
+
+    holds: list[tuple[int, float, float]] = []
+    for n in notes:
+        if str(n.get("type", "tap")) != "hold":
+            continue
+        lane = _as_int(n.get("lane"), -999)
+        if lane < 0:
+            continue
+        start = _as_float(n.get("time"), 0.0)
+        end = _as_float(n.get("end_time", n.get("time")), start)
+        if end < start:
+            start, end = end, start
+        holds.append((lane, start - pad_before, end + pad_after))
+
+    if not holds:
+        return notes
+
+    def overlaps(a0: float, a1: float, b0: float, b1: float) -> bool:
+        return not (a1 < b0 or a0 > b1)
+
+    cleaned: list[dict[str, Any]] = []
+    for n in notes:
+        typ = str(n.get("type", "tap"))
+        if typ == "hold":
+            cleaned.append(n)
+            continue
+
+        lane = _as_int(n.get("lane"), -999)
+        t0 = _as_float(n.get("time"), 0.0)
+        t1 = _as_float(n.get("end_time", n.get("time")), t0)
+        if t1 < t0:
+            t0, t1 = t1, t0
+
+        remove = False
+        for hold_lane, hold_start, hold_end in holds:
+            if typ == "roll" and remove_roll_overlap and overlaps(t0, t1, hold_start, hold_end):
+                remove = True
+                break
+            if lane == hold_lane and overlaps(t0, t1, hold_start, hold_end):
+                remove = True
+                break
+
+        if not remove:
+            cleaned.append(n)
+
+    return cleaned

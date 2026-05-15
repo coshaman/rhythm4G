@@ -1,17 +1,16 @@
-# Rhythm4G v14
+# Rhythm4G v16
 
 **Rhythm4G**는 MP3/WAV/OGG/FLAC/M4A 파일을 불러와 자동으로 리듬게임 채보를 만들고, PC 키보드로 플레이할 수 있는 Python 기반 리듬게임 MVP입니다.
 
 - 게임명: Rhythm4G
 - 개발자: 집돌이 페렐만
 
-## v14 변경사항
+## v16 변경사항
 
-- 롱노트를 다시 구현했습니다. 이제 head/tail/sustain bar가 위에서 자연스럽게 내려오며, 최소 길이를 늘려 실제로 누르고 유지할 수 있습니다.
-- 롱노트가 배치된 lane 안의 일반 노트는 해당 sustain 구간에서 제거되어 같은 줄 충돌이 생기지 않습니다.
-- 키를 꾹 누른 상태가 유지되면 `KEYDOWN` 반복 이벤트 없이도 롱노트가 active 상태로 유지되고 tail에서 판정됩니다.
-- 연타노트 생성 기준을 완화하고 fallback 후보를 추가해 실제 곡에서 더 자주 확인할 수 있게 했습니다.
-- 런처 UI를 카드형/표형 목록으로 정리하고, 긴 곡명 때문에 가로로 잘리는 문제를 줄였습니다.
+- 롱노트가 있는 lane의 sustain 구간에는 tap/chord/jack이 절대 배치되지 않도록 최종 정리 pass를 추가했습니다.
+- density-fill, chord clustering, dedupe 같은 후처리 이후에도 다시 hold overlap safety pass를 실행합니다.
+- 기존에 이미 생성된 채보도 플레이 시 같은 lane의 겹노트가 자동 제거됩니다.
+- 롱노트/연타노트의 v15 동작은 유지합니다. 롱노트는 head/tick/tail 구조이고, 연타노트는 최소 15회 이상의 distinct key press를 요구합니다.
 
 ## v8 주요 변경점
 
