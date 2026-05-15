@@ -90,6 +90,15 @@ class RhythmGame:
         self.control_keys = control_keys_from_settings()
         self.control_key_to_action = self._build_control_key_map(self.control_keys)
 
+        # v10 input robustness: on some Windows/Korean/Japanese IME setups,
+        # pygame KEYDOWN.key may not be enough for letter keys even though
+        # Escape still works.  Keep both key-code and normalized-name maps,
+        # and resolve input from event.key, pygame.key.name(event.key), and
+        # event.unicode.
+        self.key_name_to_lane = {str(name).strip().lower(): lane for lane, name in enumerate(self.keys)}
+        self.special_name_to_mode = {str(key).strip().lower(): mode for mode, key in self.special_keys.items()}
+        self.control_name_to_action = {str(key).strip().lower(): action for action, key in self.control_keys.items()}
+
         base_speed = float(self.chart.get("base_scroll_speed", self.chart.get("scroll_speed", 720)))
         # Runtime compatibility pass: old v7 charts may already contain exact
         # chord timestamps, but their visual speed/color/raw_time can still differ
@@ -231,6 +240,54 @@ class RhythmGame:
             if code not in self.key_to_lane and code not in self.special_key_to_mode:
                 out[code] = action
         return out
+
+    def _event_key_names(self, event: pygame.event.Event) -> set[str]:
+        names: set[str] = set()
+        try:
+            key_name = pygame.key.name(event.key).strip().lower()
+            if key_name:
+                names.add("escape" if key_name == "esc" else key_name)
+        except Exception:
+            pass
+        try:
+            text = str(getattr(event, "unicode", "")).strip().lower()
+            if text:
+                names.add(text)
+        except Exception:
+            pass
+        return names
+
+    def _resolve_key_action(self, event: pygame.event.Event) -> tuple[str, str | int] | None:
+        """Resolve a KEYDOWN into control/special/lane.
+
+        Control keys are checked first so Back/Escape, Pause, and Retry remain
+        responsive.  Lane keys are checked by both key-code and normalized key
+        name to avoid missed input on non-US keyboard layouts or active IMEs.
+        """
+        action = self.control_key_to_action.get(event.key)
+        if action:
+            return ("control", action)
+
+        mode = self.special_key_to_mode.get(event.key)
+        if mode:
+            return ("special", mode)
+
+        lane = self.key_to_lane.get(event.key)
+        if lane is not None:
+            return ("lane", lane)
+
+        for name in self._event_key_names(event):
+            action = self.control_name_to_action.get(name)
+            if action:
+                return ("control", action)
+            mode = self.special_name_to_mode.get(name)
+            if mode:
+                return ("special", mode)
+            lane = self.key_name_to_lane.get(name)
+            if lane is not None:
+                return ("lane", lane)
+
+        return None
 
     def song_time(self) -> float:
         if self.paused:
@@ -402,17 +459,21 @@ class RhythmGame:
                 if event.type == pygame.QUIT:
                     self.running = False
                 elif event.type == pygame.KEYDOWN:
-                    action = self.control_key_to_action.get(event.key)
-                    if action == "back":
-                        self.running = False
-                    elif action == "retry":
-                        return self.restart()
-                    elif action == "pause":
-                        self.toggle_pause(st)
-                    elif not self.paused and event.key in self.special_key_to_mode:
-                        self.switch_effect(self.special_key_to_mode[event.key], st)
-                    elif not self.paused and event.key in self.key_to_lane:
-                        self.handle_hit(self.key_to_lane[event.key], st)
+                    resolved = self._resolve_key_action(event)
+                    if resolved is None:
+                        continue
+                    kind, value = resolved
+                    if kind == "control":
+                        if value == "back":
+                            self.running = False
+                        elif value == "retry":
+                            return self.restart()
+                        elif value == "pause":
+                            self.toggle_pause(st)
+                    elif not self.paused and kind == "special":
+                        self.switch_effect(str(value), st)
+                    elif not self.paused and kind == "lane":
+                        self.handle_hit(int(value), st)
 
             if not self.paused:
                 self.update_misses(st)

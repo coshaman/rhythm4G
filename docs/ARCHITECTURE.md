@@ -101,7 +101,7 @@ Korean and other non-ASCII titles are stored with UTF-8 JSON (`ensure_ascii=Fals
 
 `rhythmforge/chart_utils.py` normalizes clean multi-lane chord groups so simultaneous notes share one render time, one visual scroll speed, and one visual color. The game applies the same pass at load time, so older v7 chart JSON files are corrected without regeneration. Note body geometry is fixed per lane; highlight/accent notes use external glow only.
 
-## v9 변경사항
+## v10 변경사항
 
 - 일본어/중국어 곡 제목 표시를 위해 런처와 플레이 화면의 CJK 폰트 탐색을 강화했습니다. JSON 저장은 UTF-8/`ensure_ascii=False`를 유지합니다.
 - 노트 색상과 키빔/타격 이펙트 색상을 분리했습니다. 노트는 파랑/노랑/보라/분홍 계열, 키빔은 중립적인 청백색 계열을 사용하여 겹치는 상황의 가시성을 높였습니다.

@@ -85,17 +85,60 @@ class Rhythm4GLauncher(tk.Tk):
         style.configure("Horizontal.TProgressbar", background="#8ab4ff")
 
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=22)
-        root.pack(fill="both", expand=True)
+        # The launcher can become taller than the window after importing long
+        # file names or showing many settings. Put the main content in a
+        # vertically scrollable canvas so every button remains reachable on
+        # smaller screens and in packaged builds.
+        outer = ttk.Frame(self, padding=22)
+        outer.pack(fill="both", expand=True)
+        outer.rowconfigure(1, weight=1)
+        outer.columnconfigure(0, weight=1)
 
-        title_row = ttk.Frame(root)
-        title_row.pack(fill="x")
-        ttk.Label(title_row, text="Rhythm4G", style="Title.TLabel").pack(side="left")
-        ttk.Label(title_row, text="  by 집돌이 페렐만").pack(side="left", padx=(10, 0))
-        ttk.Label(title_row, textvariable=self.status_var).pack(side="right", anchor="e")
+        title_row = ttk.Frame(outer)
+        title_row.grid(row=0, column=0, sticky="ew")
+        title_row.columnconfigure(1, weight=1)
+        ttk.Label(title_row, text="Rhythm4G", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(title_row, text="  by 집돌이 페렐만").grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ttk.Label(title_row, textvariable=self.status_var).grid(row=0, column=2, sticky="e")
+
+        scroll_shell = ttk.Frame(outer)
+        scroll_shell.grid(row=1, column=0, sticky="nsew", pady=(20, 0))
+        scroll_shell.rowconfigure(0, weight=1)
+        scroll_shell.columnconfigure(0, weight=1)
+
+        self.main_canvas = tk.Canvas(
+            scroll_shell,
+            bg="#111522",
+            borderwidth=0,
+            highlightthickness=0,
+            yscrollincrement=24,
+        )
+        self.main_canvas.grid(row=0, column=0, sticky="nsew")
+
+        self.main_scrollbar = ttk.Scrollbar(
+            scroll_shell,
+            orient="vertical",
+            command=self.main_canvas.yview,
+        )
+        self.main_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.main_canvas.configure(yscrollcommand=self.main_scrollbar.set)
+
+        root = ttk.Frame(self.main_canvas)
+        self._main_window_id = self.main_canvas.create_window((0, 0), window=root, anchor="nw")
+
+        def _sync_scroll_region(_event: object | None = None) -> None:
+            self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+
+        def _sync_canvas_width(event: tk.Event) -> None:
+            self.main_canvas.itemconfigure(self._main_window_id, width=event.width)
+
+        root.bind("<Configure>", _sync_scroll_region)
+        self.main_canvas.bind("<Configure>", _sync_canvas_width)
+        self.main_canvas.bind("<Enter>", lambda _event: self._bind_mousewheel())
+        self.main_canvas.bind("<Leave>", lambda _event: self._unbind_mousewheel())
 
         body = ttk.Frame(root)
-        body.pack(fill="both", expand=True, pady=(20, 0))
+        body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
@@ -203,6 +246,27 @@ class Rhythm4GLauncher(tk.Tk):
         folder_row.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         folder_row.columnconfigure(0, weight=1)
         ttk.Label(folder_row, text=f"Charts: {charts_dir()}\nRecords: {records_path()}", style="Muted.TLabel", wraplength=470).grid(row=0, column=0, sticky="w")
+
+    def _bind_mousewheel(self) -> None:
+        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._on_mousewheel, add="+")
+        self.bind_all("<Button-5>", self._on_mousewheel, add="+")
+
+    def _unbind_mousewheel(self) -> None:
+        self.unbind_all("<MouseWheel>")
+        self.unbind_all("<Button-4>")
+        self.unbind_all("<Button-5>")
+
+    def _on_mousewheel(self, event: tk.Event) -> str:
+        # Windows/macOS use MouseWheel; some Linux Tk builds use Button-4/5.
+        if getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+        else:
+            delta = -1 if int(getattr(event, "delta", 0)) > 0 else 1
+        self.main_canvas.yview_scroll(delta * 3, "units")
+        return "break"
 
     def parse_keys(self) -> list[str]:
         raw = self.keys_var.get().replace(",", " ").split()
