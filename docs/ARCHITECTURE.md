@@ -1,4 +1,4 @@
-# Rhythm4G Architecture v8
+# Rhythm4G Architecture v13
 
 ## Entry points
 
@@ -110,3 +110,17 @@ Korean and other non-ASCII titles are stored with UTF-8 JSON (`ensure_ascii=Fals
 - 뒤로가기 키도 전역 제어키로 관리합니다. 기본값은 `Escape`입니다.
 - 점수 체계를 1,000,000점 고정 만점으로 변경했습니다. 전부 PERFECT이면 정확히 1,000,000점입니다.
 
+
+## v12 gameplay additions
+
+- The gameplay input layer resolves physical SDL scancodes before key names, improving layout/IME independence.
+- Tap/hold notes are lane-specific. Roll notes have `type: "roll"`, `lane: -1`, `end_time`, and `required_hits`; while active they accept any gameplay key.
+- Anti-mash handling consumes near-future lane notes as BAD/EARLY when the player presses before the largest judgement window but close enough to be clearly targeting the note.
+- The launcher uses a responsive scrollable canvas. It switches between two-column and stacked layouts based on available width.
+
+
+## v13 fixes
+
+- Launcher difficulty selection is now multi-select. `analyze_selected_audio()` generates all selected difficulties sequentially and reports all generated chart paths.
+- `RhythmGame.update_misses()` only handles gameplay state. Rendering helpers such as `draw_hit_bursts()`, roll rendering, hold rendering, result overlay, and main `draw()` are restored as class methods.
+- CLI `generate` and `auto` accept multiple difficulties using `--difficulty normal hard extreme master`.

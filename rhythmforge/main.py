@@ -17,7 +17,7 @@ def main() -> None:
 
     gen = sub.add_parser("generate", help="Generate chart JSON from audio")
     gen.add_argument("audio")
-    gen.add_argument("--difficulty", choices=list(DIFFICULTIES), default="hard")
+    gen.add_argument("--difficulty", choices=list(DIFFICULTIES), nargs="+", default=["hard"], help="One or more difficulties, e.g. --difficulty normal hard extreme")
     gen.add_argument("--output", default=None)
     gen.add_argument("--bpm", type=float, default=None, help="Manual BPM override")
 
@@ -26,20 +26,31 @@ def main() -> None:
 
     auto = sub.add_parser("auto", help="Generate a chart and play immediately")
     auto.add_argument("audio")
-    auto.add_argument("--difficulty", choices=list(DIFFICULTIES), default="hard")
+    auto.add_argument("--difficulty", choices=list(DIFFICULTIES), nargs="+", default=["hard"], help="One or more difficulties; auto plays the first generated chart")
     auto.add_argument("--output", default=None)
     auto.add_argument("--bpm", type=float, default=None, help="Manual BPM override")
 
     args = parser.parse_args()
     if args.command == "generate":
-        out = analyze_audio(args.audio, args.difficulty, args.output, manual_bpm=args.bpm)
-        print(f"Chart written: {out}")
+        outs = []
+        if args.output and len(args.difficulty) > 1:
+            raise SystemExit("--output can only be used with a single difficulty")
+        for difficulty in args.difficulty:
+            out = analyze_audio(args.audio, difficulty, args.output, manual_bpm=args.bpm)
+            outs.append(out)
+            print(f"Chart written: {out}")
     elif args.command == "play":
         play_chart(args.chart)
     elif args.command == "auto":
-        out = analyze_audio(args.audio, args.difficulty, args.output, manual_bpm=args.bpm)
-        print(f"Chart written: {out}")
-        play_chart(out)
+        outs = []
+        if args.output and len(args.difficulty) > 1:
+            raise SystemExit("--output can only be used with a single difficulty")
+        for difficulty in args.difficulty:
+            out = analyze_audio(args.audio, difficulty, args.output, manual_bpm=args.bpm)
+            outs.append(out)
+            print(f"Chart written: {out}")
+        if outs:
+            play_chart(outs[0])
     elif args.command == "app" or args.command is None:
         launcher_main()
     else:

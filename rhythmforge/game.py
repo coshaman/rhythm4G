@@ -53,6 +53,12 @@ class RuntimeNote:
     source: str = "unknown"
     grid_locked: bool = True
     raw_time: float | None = None
+    note_type: str = "tap"
+    end_time: float | None = None
+    required_hits: int = 0
+    remaining_hits: int = 0
+    active: bool = False
+    hold_judgement: str | None = None
     hit: bool = False
     missed: bool = False
     judgement: str | None = None
@@ -83,12 +89,15 @@ class RhythmGame:
         # appeared to be ignored depending on which chart JSON was loaded.
         self.keys = gameplay_keys_for_lanes(self.lanes)
         self.key_to_lane = self._build_key_map(self.keys)
+        self.scancode_to_lane = self._build_key_scancode_map(self.keys)
         special = dict(DEFAULT_SPECIAL_KEYS)
         special.update(special_keys_from_settings())
         self.special_keys = special
         self.special_key_to_mode = self._build_special_key_map(special)
+        self.special_scancode_to_mode = self._build_special_scancode_map(special)
         self.control_keys = control_keys_from_settings()
         self.control_key_to_action = self._build_control_key_map(self.control_keys)
+        self.control_scancode_to_action = self._build_control_scancode_map(self.control_keys)
 
         # v10 input robustness: on some Windows/Korean/Japanese IME setups,
         # pygame KEYDOWN.key may not be enough for letter keys even though
@@ -113,10 +122,14 @@ class RhythmGame:
                 time=float(n.get("render_time", n.get("time", 0.0))),
                 raw_time=float(n.get("raw_time", n.get("time", 0.0))),
                 grid_locked=bool(n.get("grid_locked", True)),
-                lane=int(n["lane"]),
+                lane=int(n.get("lane", -1)),
                 scroll_speed=float(n.get("visual_scroll_speed", n.get("scroll_speed", base_speed))),
                 color=str(n.get("color", "normal")),
                 source=str(n.get("source", "unknown")),
+                note_type=str(n.get("type", "tap")),
+                end_time=float(n.get("end_time", n.get("time", 0.0))) if n.get("end_time") is not None else None,
+                required_hits=int(n.get("required_hits", 0) or 0),
+                remaining_hits=int(n.get("required_hits", 0) or 0),
             )
             for n in chart_notes
         ]
@@ -170,6 +183,9 @@ class RhythmGame:
         self.lane_flash_kind = ["normal" for _ in range(self.lanes)]
         self.hit_bursts: list[HitBurst] = []
         self.last_hit_at = 0.0
+        self.lane_down = [False for _ in range(self.lanes)]
+        self.lane_empty_cooldown_until = [0.0 for _ in range(self.lanes)]
+        self.early_mash_window = 0.26
 
         self.audio_enabled = False
         self.effects: EffectFiles | None = None
@@ -205,6 +221,30 @@ class RhythmGame:
             return aliases[name]
         return pygame.key.key_code(name)
 
+    def _key_scancode(self, name: str) -> int | None:
+        """Return a physical-key scancode when pygame can provide one.
+
+        Scancodes are layout/IME independent in SDL.  This makes D/F/J/K-style
+        rhythm inputs keep working even while Korean/Japanese IME is active.
+        """
+        try:
+            code = self._key_code(name)
+            getter = getattr(pygame.key, "get_scancode_from_key", None)
+            if getter is None:
+                return None
+            sc = int(getter(code))
+            return sc if sc >= 0 else None
+        except Exception:
+            return None
+
+    def _build_key_scancode_map(self, keys: list[str]) -> dict[int, int]:
+        out: dict[int, int] = {}
+        for lane, name in enumerate(keys):
+            sc = self._key_scancode(name)
+            if sc is not None:
+                out[sc] = lane
+        return out
+
     def _build_key_map(self, keys: list[str]) -> dict[int, int]:
         out: dict[int, int] = {}
         for lane, name in enumerate(keys):
@@ -227,6 +267,16 @@ class RhythmGame:
                 out[code] = mode
         return out
 
+    def _build_special_scancode_map(self, special: dict[str, str]) -> dict[int, str]:
+        out: dict[int, str] = {}
+        for mode, key in special.items():
+            if mode not in {"normal", "speed", "echo"}:
+                continue
+            sc = self._key_scancode(key)
+            if sc is not None and sc not in self.scancode_to_lane:
+                out[sc] = mode
+        return out
+
     def _build_control_key_map(self, control: dict[str, str]) -> dict[int, str]:
         out: dict[int, str] = {}
         for action in ("pause", "retry", "back"):
@@ -239,6 +289,18 @@ class RhythmGame:
                 continue
             if code not in self.key_to_lane and code not in self.special_key_to_mode:
                 out[code] = action
+        return out
+
+    def _build_control_scancode_map(self, control: dict[str, str]) -> dict[int, str]:
+        out: dict[int, str] = {}
+        blocked = set(self.scancode_to_lane) | set(self.special_scancode_to_mode)
+        for action in ("pause", "retry", "back"):
+            key = control.get(action)
+            if not key:
+                continue
+            sc = self._key_scancode(key)
+            if sc is not None and sc not in blocked:
+                out[sc] = action
         return out
 
     def _event_key_names(self, event: pygame.event.Event) -> set[str]:
@@ -260,10 +322,22 @@ class RhythmGame:
     def _resolve_key_action(self, event: pygame.event.Event) -> tuple[str, str | int] | None:
         """Resolve a KEYDOWN into control/special/lane.
 
-        Control keys are checked first so Back/Escape, Pause, and Retry remain
-        responsive.  Lane keys are checked by both key-code and normalized key
-        name to avoid missed input on non-US keyboard layouts or active IMEs.
+        Resolution order intentionally uses scancode first, then key-code/name.
+        SDL scancodes represent the physical key, so gameplay keys work even
+        when the OS input method is Korean/Japanese/Chinese instead of English.
         """
+        scancode = int(getattr(event, "scancode", -1) or -1)
+        if scancode >= 0:
+            action = self.control_scancode_to_action.get(scancode)
+            if action:
+                return ("control", action)
+            mode = self.special_scancode_to_mode.get(scancode)
+            if mode:
+                return ("special", mode)
+            lane = self.scancode_to_lane.get(scancode)
+            if lane is not None:
+                return ("lane", lane)
+
         action = self.control_key_to_action.get(event.key)
         if action:
             return ("control", action)
@@ -436,6 +510,7 @@ class RhythmGame:
 
     def run(self) -> None:
         self.audio_enabled = self.init_pygame_audio()
+        pygame.key.set_repeat(0)
         pygame.display.set_caption("Rhythm4G")
         screen = pygame.display.set_mode((self.width, self.height))
         clock = pygame.time.Clock()
@@ -474,6 +549,10 @@ class RhythmGame:
                         self.switch_effect(str(value), st)
                     elif not self.paused and kind == "lane":
                         self.handle_hit(int(value), st)
+                elif event.type == pygame.KEYUP:
+                    resolved = self._resolve_key_action(event)
+                    if resolved and resolved[0] == "lane":
+                        self.handle_key_up(int(resolved[1]), st)
 
             if not self.paused:
                 self.update_misses(st)
@@ -487,57 +566,200 @@ class RhythmGame:
         pygame.quit()
 
     def find_candidate(self, lane: int, st: float) -> RuntimeNote | None:
-        # Only consider notes in this lane and within the largest judgement window.
-        # This supports dense chords because each lane independently resolves its
-        # nearest note, even when several notes share the same timestamp.
         max_window = max(j.ms for j in JUDGEMENTS) / 1000.0
         candidates = [
             n for n in self.notes
-            if n.lane == lane and not n.hit and not n.missed and abs(n.time - st) <= max_window
+            if n.note_type in {"tap", "hold"}
+            and n.lane == lane and not n.hit and not n.missed and not n.active
+            and abs(n.time - st) <= max_window
         ]
         if not candidates:
             return None
-        # Prefer closest timing, then grid-locked rhythmic hits, then stronger colors.
         priority = {"highlight": 3, "accent": 2, "bright": 1, "normal": 0}
         return min(candidates, key=lambda n: (abs(n.time - st), -int(n.grid_locked), -priority.get(n.color, 0)))
 
-    def handle_hit(self, lane: int, st: float) -> None:
-        note = self.find_candidate(lane, st)
-        if note is None:
-            # Empty key presses are shown but do not instantly delete every chord.
-            self.show_judgement("EMPTY")
-            self.flash_lane(lane, "normal")
-            return
-        delta_ms = abs(note.time - st) * 1000.0
+    def find_early_mash_target(self, lane: int, st: float) -> RuntimeNote | None:
+        max_window = max(j.ms for j in JUDGEMENTS) / 1000.0
+        future = [
+            n for n in self.notes
+            if n.note_type == "tap"
+            and n.lane == lane and not n.hit and not n.missed and not n.active
+            and max_window < (n.time - st) <= self.early_mash_window
+        ]
+        if not future:
+            return None
+        return min(future, key=lambda n: n.time)
+
+    def active_roll_candidate(self, st: float) -> RuntimeNote | None:
+        candidates = [
+            n for n in self.notes
+            if n.note_type == "roll" and not n.hit and not n.missed
+            and n.time - 0.04 <= st <= (n.end_time or n.time) + 0.10
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda n: abs(max(n.time, min(st, n.end_time or n.time)) - st))
+
+    def _apply_judgement(self, note: RuntimeNote, judge_name: str, *, combo: bool = True) -> None:
+        note.hit = True
+        note.active = False
+        note.judgement = judge_name
+        self.judge_counts[judge_name] += 1
+        self.hit_count += 1
+        if combo and judge_name != "BAD":
+            self.combo += 1
+            self.max_combo = max(self.max_combo, self.combo)
+        else:
+            self.combo = 0
+        self.recalculate_score()
+        self.show_judgement(judge_name)
+        if 0 <= note.lane < self.lanes:
+            self.flash_lane(note.lane, note.color)
+            self.hit_bursts.append(HitBurst(lane=note.lane, created_at=perf_counter(), color=note.color, judgement=judge_name))
+        self.last_hit_at = perf_counter()
+
+    def _judgement_for_delta(self, delta_ms: float) -> str | None:
         for judge in JUDGEMENTS:
             if delta_ms <= judge.ms:
-                note.hit = True
-                note.judgement = judge.name
-                self.judge_counts[judge.name] += 1
-                self.hit_count += 1
-                self.combo += 1
-                self.max_combo = max(self.max_combo, self.combo)
-                self.recalculate_score()
-                self.show_judgement(judge.name)
-                self.flash_lane(lane, note.color)
-                self.hit_bursts.append(HitBurst(lane=lane, created_at=perf_counter(), color=note.color, judgement=judge.name))
-                self.last_hit_at = perf_counter()
+                return judge.name
+        return None
+
+    def start_hold(self, note: RuntimeNote, lane: int, st: float, judge_name: str | None = None) -> None:
+        """Start a hold note without consuming it as a tap.
+
+        A hold scores only when it survives until end_time.  This method exists
+        separately from _apply_judgement so holding a key is represented as a
+        sustained active state, not as one instant key press.
+        """
+        if note.hit or note.missed or note.active:
+            return
+        note.active = True
+        note.hold_judgement = judge_name or self._judgement_for_delta(abs(note.time - st) * 1000.0) or "GOOD"
+        self.show_judgement("HOLD")
+        self.flash_lane(lane, note.color)
+        self.hit_bursts.append(HitBurst(lane=lane, created_at=perf_counter(), color=note.color, judgement=note.hold_judgement))
+        self.last_hit_at = perf_counter()
+
+    def handle_hit(self, lane: int, st: float) -> None:
+        now = perf_counter()
+        if 0 <= lane < len(self.lane_down):
+            self.lane_down[lane] = True
+
+        note = self.find_candidate(lane, st)
+        if note is not None:
+            delta_ms = abs(note.time - st) * 1000.0
+            judge_name = self._judgement_for_delta(delta_ms)
+            if judge_name is None:
+                self.mark_miss(note)
+                self.flash_lane(lane, "normal")
                 return
-        self.mark_miss(note)
-        self.flash_lane(lane, "normal")
+            if note.note_type == "hold":
+                self.start_hold(note, lane, st, judge_name)
+                return
+            self._apply_judgement(note, judge_name, combo=True)
+            return
+
+        # Roll notes intentionally accept any gameplay key, but only during their
+        # visible active span.  They are generated in sections without other
+        # lane notes, so normal taps/holds always have priority above this.
+        roll = self.active_roll_candidate(st)
+        if roll is not None:
+            roll.active = True
+            roll.remaining_hits = max(0, int(roll.remaining_hits) - 1)
+            self.show_judgement(f"ROLL {roll.remaining_hits}")
+            self.flash_lane(lane, "bright")
+            self.hit_bursts.append(HitBurst(lane=lane, created_at=now, color="bright", judgement="ROLL"))
+            self.last_hit_at = now
+            if roll.remaining_hits <= 0:
+                self._apply_judgement(roll, "PERFECT", combo=True)
+            return
+
+        early = self.find_early_mash_target(lane, st)
+        if early is not None:
+            # Anti-mash behavior: if the player is repeatedly pressing while a
+            # note is approaching but not yet judgeable, consume that note as BAD
+            # instead of allowing spam to eventually auto-hit it.
+            early.hit = True
+            early.judgement = "BAD"
+            self.judge_counts["BAD"] += 1
+            self.hit_count += 1
+            self.combo = 0
+            self.recalculate_score()
+            self.show_judgement("EARLY")
+            self.flash_lane(lane, "normal")
+            self.lane_empty_cooldown_until[lane] = now + 0.10
+            return
+
+        if now >= self.lane_empty_cooldown_until[lane]:
+            self.show_judgement("EMPTY")
+            self.flash_lane(lane, "normal")
+            self.lane_empty_cooldown_until[lane] = now + 0.06
+
+    def finish_hold(self, note: RuntimeNote, judgement: str | None = None) -> None:
+        if note.hit or note.missed:
+            return
+        self._apply_judgement(note, judgement or note.hold_judgement or "GOOD", combo=True)
+
+    def handle_key_up(self, lane: int, st: float) -> None:
+        if 0 <= lane < len(self.lane_down):
+            self.lane_down[lane] = False
+        for note in self.notes:
+            if note.note_type != "hold" or note.lane != lane or not note.active or note.hit or note.missed:
+                continue
+            end = note.end_time or note.time
+            if st >= end - 0.08:
+                self.finish_hold(note, note.hold_judgement or "GOOD")
+            else:
+                self.mark_miss(note)
+            return
 
     def mark_miss(self, note: RuntimeNote) -> None:
         if note.hit or note.missed:
             return
         note.missed = True
+        note.active = False
         note.judgement = "MISS"
         self.judge_counts["MISS"] += 1
         self.recalculate_score()
         self.break_combo("MISS")
 
     def update_misses(self, st: float) -> None:
+        """Advance miss logic only. Rendering belongs in draw()."""
+        miss_window = MISS_MS / 1000.0
         for note in self.notes:
-            if not note.hit and not note.missed and (st - note.time) * 1000.0 > MISS_MS:
+            if note.hit or note.missed:
+                continue
+
+            if note.note_type == "hold":
+                end = note.end_time or note.time
+                if note.active:
+                    # Long key press support: as long as the physical lane key is
+                    # still down, automatically finish at the tail.
+                    if 0 <= note.lane < len(self.lane_down) and self.lane_down[note.lane] and st >= end - 0.01:
+                        self.finish_hold(note, note.hold_judgement or "GOOD")
+                    elif st > end + miss_window:
+                        self.mark_miss(note)
+                else:
+                    # If the key was already held as the head enters the judge
+                    # window, start the hold. This makes sustained KEYDOWN state
+                    # matter, rather than requiring repeated keydown events.
+                    if 0 <= note.lane < len(self.lane_down) and self.lane_down[note.lane]:
+                        delta_ms = abs(note.time - st) * 1000.0
+                        judge_name = self._judgement_for_delta(delta_ms)
+                        if judge_name is not None:
+                            self.start_hold(note, note.lane, st, judge_name)
+                            continue
+                    if st - note.time > miss_window:
+                        self.mark_miss(note)
+                continue
+
+            if note.note_type == "roll":
+                end = note.end_time or note.time
+                if st > end + miss_window and note.remaining_hits > 0:
+                    self.mark_miss(note)
+                continue
+
+            if st - note.time > miss_window:
                 self.mark_miss(note)
 
     def recalculate_score(self) -> None:
@@ -595,9 +817,6 @@ class RhythmGame:
         right = self.width - self.board_x + 18
         field_top = 214
         field_bottom = self.height - 104
-        # Grid markers now carry their own scroll speed.  This makes the grey
-        # timing lines travel with the same local speed bucket used by nearby
-        # notes instead of the old global chart speed.
         min_t = st - 0.25
         max_t = st + 3.2
         for marker in self.grid_markers:
@@ -624,12 +843,12 @@ class RhythmGame:
             if age > 0.34:
                 continue
             alive.append(burst)
+            if not (0 <= burst.lane < self.lanes):
+                continue
             x = self.board_x + burst.lane * (self.lane_w + self.lane_gap) + self.lane_w // 2
             t = age / 0.34
             radius = int(18 + 38 * t)
             alpha_like = max(0, 1.0 - t)
-            # Neutral key-beam effect.  Do not reuse note colors; otherwise dense
-            # chords and hit bursts blend into each other.
             ring = (226, 238, 255)
             core = (145, 190, 255)
             pygame.draw.circle(screen, ring, (x, self.hit_y), radius, max(1, int(3 * alpha_like)))
@@ -670,11 +889,94 @@ class RhythmGame:
         hint = font_mid.render(f"{self.control_keys.get('retry','backspace').upper()} Retry    {self.control_keys.get('back','escape').upper()} Back", True, (255, 255, 255))
         screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.bottom - 38)))
 
+    def draw_roll_note(self, screen: pygame.Surface, font_mid, note: RuntimeNote, st: float) -> None:
+        field_top = 214
+        end = note.end_time or note.time
+        y1 = self.hit_y - (note.time - st) * note.scroll_speed
+        y2 = self.hit_y - (end - st) * note.scroll_speed
+        top = min(y1, y2)
+        bottom = max(y1, y2)
+        if bottom < field_top or top > self.height + 60:
+            return
+        left = self.board_x - 18
+        width = self.lanes * self.lane_w + (self.lanes - 1) * self.lane_gap + 36
+        visible_top = int(max(field_top, top))
+        visible_bottom = int(min(self.height + 60, bottom))
+        rect = pygame.Rect(left, visible_top, width, max(34, visible_bottom - visible_top))
+        pygame.draw.rect(screen, (58, 76, 116), rect, border_radius=16)
+        pygame.draw.rect(screen, (180, 214, 255), rect, width=3, border_radius=16)
+        remaining = max(0, int(note.remaining_hits))
+        label = font_mid.render(f"ROLL  {remaining}", True, (245, 250, 255))
+        screen.blit(label, label.get_rect(center=rect.center))
+
+    def draw_lane_note(self, screen: pygame.Surface, font_small, note: RuntimeNote, st: float) -> None:
+        if not (0 <= note.lane < self.lanes):
+            return
+        field_top = 214
+        field_bottom = self.height - 104
+        y_head = self.hit_y - (note.time - st) * note.scroll_speed
+        end = note.end_time if note.note_type == "hold" and note.end_time is not None else None
+
+        x = self.board_x + note.lane * (self.lane_w + self.lane_gap)
+        body, outline = NOTE_COLORS.get(note.color, NOTE_COLORS["normal"])
+        w = int(self.lane_w * 0.84)
+        h = 26
+        center_x = x + self.lane_w // 2
+
+        if end is not None:
+            y_tail = self.hit_y - (end - st) * note.scroll_speed
+            top = min(y_head, y_tail)
+            bottom = max(y_head, y_tail)
+            if bottom < field_top or top > self.height + 56:
+                return
+
+            # Draw the sustain body clipped into the playfield.  The bar falls in
+            # from the top naturally instead of popping in as a short rectangle.
+            visible_top = int(max(field_top, top))
+            visible_bottom = int(min(field_bottom + 40, bottom))
+            if visible_bottom > visible_top:
+                hold_w = int(self.lane_w * 0.44)
+                hold_rect = pygame.Rect(0, visible_top, hold_w, max(8, visible_bottom - visible_top))
+                hold_rect.centerx = center_x
+                fill = (54, 72, 112) if not note.active else (72, 96, 148)
+                pygame.draw.rect(screen, fill, hold_rect, border_radius=12)
+                pygame.draw.rect(screen, outline, hold_rect, width=2, border_radius=12)
+
+            # Head and tail caps.  The head is the press point, the tail is the
+            # release point.  Both are clipped so they appear only in the lane.
+            for yy, label_text, is_tail in ((y_head, "HOLD", False), (y_tail, "END", True)):
+                cap = pygame.Rect(0, 0, w if not is_tail else int(w * 0.78), h if not is_tail else 20)
+                cap.center = (center_x, int(round(yy)))
+                if cap.bottom < field_top or cap.top > field_bottom + 40:
+                    continue
+                if note.color in {"accent", "highlight"} or note.active:
+                    glow = cap.inflate(16, 12)
+                    pygame.draw.rect(screen, body, glow, width=2, border_radius=14)
+                pygame.draw.rect(screen, body, cap, border_radius=9)
+                pygame.draw.rect(screen, outline, cap, width=2, border_radius=9)
+                txt = font_small.render(label_text, True, (255, 255, 255))
+                screen.blit(txt, txt.get_rect(center=cap.center))
+            return
+
+        # Tap note.
+        if st < -0.05 or y_head < field_top or y_head > self.height + 50:
+            return
+        note_rect = pygame.Rect(0, 0, w, h)
+        note_rect.center = (center_x, int(round(y_head)))
+        if note_rect.bottom < field_top:
+            return
+        if note.color in {"accent", "highlight"}:
+            glow = note_rect.inflate(16, 12)
+            pygame.draw.rect(screen, body, glow, width=2, border_radius=14)
+        pygame.draw.rect(screen, body, note_rect, border_radius=9)
+        pygame.draw.rect(screen, outline, note_rect, width=2, border_radius=9)
+        if not note.grid_locked:
+            pygame.draw.circle(screen, (245, 245, 245), (note_rect.right - 9, note_rect.top + 7), 3)
+
     def draw(self, screen, font_big, font_mid, font_small, st: float) -> None:
         screen.fill((8, 10, 18))
         now = perf_counter()
 
-        # Subtle vertical gradient bands.
         for i in range(0, self.height, 28):
             shade = 12 + int(8 * (i / self.height))
             pygame.draw.rect(screen, (shade, shade + 2, shade + 11), (0, i, self.width, 28))
@@ -691,7 +993,6 @@ class RhythmGame:
         control_hint = f"{self.control_keys.get('pause','p').upper()} Pause / {self.control_keys.get('retry','backspace').upper()} Retry / {self.control_keys.get('back','escape').upper()} Back"
         screen.blit(font_small.render(fx_hint + "    " + control_hint, True, (154, 166, 198)), (38, 76))
 
-        # Large, persistent combo/score HUD. Combo now stays readable even during dense sections.
         combo_color = (255, 255, 255) if self.combo < 50 else (255, 226, 146)
         combo_scale = 1.0 + min(0.10, max(0.0, 0.12 - (now - self.last_hit_at)) * 0.9)
         combo_surface = font_big.render(f"{self.combo} COMBO", True, combo_color)
@@ -701,10 +1002,6 @@ class RhythmGame:
         score_surface = font_mid.render(f"SCORE {self.score:07,d} / 1,000,000     ACC {self.accuracy():.2f}%", True, (198, 209, 238))
         screen.blit(score_surface, score_surface.get_rect(center=(self.width // 2, 184)))
 
-        # No countdown text is drawn over the playfield.  Earlier versions showed
-        # START IN briefly behind the lanes, which looked like a stray "T" flash
-        # on some window captures.
-
         for lane in range(self.lanes):
             x = self.board_x + lane * (self.lane_w + self.lane_gap)
             base = (20, 24, 39)
@@ -712,7 +1009,6 @@ class RhythmGame:
                 base = LANE_FLASH_COLORS.get(self.lane_flash_kind[lane], base)
             pygame.draw.rect(screen, base, (x, 214, self.lane_w, self.height - 318), border_radius=12)
             pygame.draw.rect(screen, (45, 54, 83), (x, 214, self.lane_w, self.height - 318), width=2, border_radius=12)
-            # Key cap area
             cap = pygame.Rect(x + 8, self.hit_y + 28, self.lane_w - 16, 48)
             pygame.draw.rect(screen, (30, 36, 56), cap, border_radius=12)
             pygame.draw.rect(screen, (80, 94, 132), cap, width=2, border_radius=12)
@@ -726,43 +1022,29 @@ class RhythmGame:
         pygame.draw.line(screen, (pulse, pulse, 255), (self.board_x - 22, self.hit_y), (self.width - self.board_x + 22, self.hit_y), 5)
         pygame.draw.line(screen, (90, 108, 160), (self.board_x - 22, self.hit_y + 7), (self.width - self.board_x + 22, self.hit_y + 7), 2)
 
+        # Roll notes are lane-independent, so draw them behind lane-specific notes.
         for note in self.notes:
-            if note.hit or note.missed:
-                continue
-            dt = note.time - st
-            y = self.hit_y - dt * note.scroll_speed
-            # Do not draw notes above the lane columns.  Earlier versions let
-            # notes appear in the header area before entering the vertical lanes.
-            if st < -0.05 or y < 214 or y > self.height + 50:
-                continue
-            x = self.board_x + note.lane * (self.lane_w + self.lane_gap)
-            body, outline = NOTE_COLORS.get(note.color, NOTE_COLORS["normal"])
-            # Chord bodies must be geometrically identical across lanes.
-            # Do not vary body width/height by lane, time pulse, or color; put
-            # emphasis only in the external glow.
-            w = int(self.lane_w * 0.84)
-            h = 26
-            note_rect = pygame.Rect(0, 0, w, h)
-            note_rect.center = (x + self.lane_w // 2, int(round(y)))
-            if note.color in {"accent", "highlight"}:
-                glow = note_rect.inflate(16, 12)
-                pygame.draw.rect(screen, body, glow, width=2, border_radius=14)
-            pygame.draw.rect(screen, body, note_rect, border_radius=9)
-            pygame.draw.rect(screen, outline, note_rect, width=2, border_radius=9)
-            if not note.grid_locked:
-                pygame.draw.circle(screen, (245, 245, 245), (note_rect.right - 9, note_rect.top + 7), 3)
+            if not note.hit and not note.missed and note.note_type == "roll":
+                self.draw_roll_note(screen, font_mid, note, st)
+        for note in self.notes:
+            if not note.hit and not note.missed and note.note_type != "roll":
+                self.draw_lane_note(screen, font_small, note, st)
 
         self.draw_hit_bursts(screen, font_small, now)
 
-        if self.judgement_text and perf_counter() < self.judgement_until:
+        if self.judgement_text and now < self.judgement_until:
             color = (255, 255, 255)
             if self.judgement_text == "MISS":
                 color = (255, 126, 126)
             elif self.judgement_text == "PERFECT":
                 color = (255, 238, 170)
+            elif self.judgement_text.startswith("ROLL"):
+                color = (180, 214, 255)
+            elif self.judgement_text == "EARLY":
+                color = (255, 170, 120)
             jt = font_big.render(self.judgement_text, True, color)
             screen.blit(jt, jt.get_rect(center=(self.width // 2, self.height // 2 + 8)))
-        if perf_counter() < self.effect_message_until:
+        if now < self.effect_message_until:
             et = font_mid.render(self.effect_message, True, (255, 232, 180))
             screen.blit(et, et.get_rect(center=(self.width // 2, 216)))
 

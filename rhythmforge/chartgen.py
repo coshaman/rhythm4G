@@ -431,6 +431,219 @@ def _add_rhythm_game_patterns(
 
 
 
+
+def _overlaps_any(t: float, intervals: list[tuple[float, float]], pad: float = 0.0) -> bool:
+    return any((a - pad) <= t <= (b + pad) for a, b in intervals)
+
+
+def _add_hold_and_roll_notes(
+    notes: list[dict[str, Any]],
+    *,
+    beat_times: np.ndarray,
+    grid: np.ndarray,
+    onset_norm: np.ndarray,
+    rms_norm: np.ndarray,
+    highlight_curve: np.ndarray,
+    highlight_threshold: float,
+    sr: int,
+    hop_length: int,
+    duration: float,
+    tempo: float,
+    cfg: dict[str, Any],
+    difficulty: str,
+    seed: int,
+) -> None:
+    """Add playable hold notes and visible roll notes.
+
+    v14 changes:
+    - Hold notes are now deliberately longer and are placed by clearing the
+      selected lane during the hold span.  This avoids impossible same-lane
+      taps inside a sustain.
+    - Rolls are less rare and have a fallback pass, so players can actually see
+      the mechanic in typical songs while still keeping them special.
+    """
+    if len(beat_times) < 4 or duration < 18:
+        return
+
+    lanes = int(cfg["lanes"])
+    base_speed = float(cfg["base_scroll_speed"])
+    beat_interval = float(np.median(np.diff(beat_times))) if len(beat_times) >= 2 else 60.0 / max(tempo, 1.0)
+    beat_interval = max(0.18, beat_interval)
+
+    def frame_span(start: float, end: float) -> tuple[int, int]:
+        f0 = int(np.clip(librosa.time_to_frames(start, sr=sr, hop_length=hop_length), 0, max(0, len(onset_norm) - 1)))
+        f1 = int(np.clip(librosa.time_to_frames(end, sr=sr, hop_length=hop_length), f0 + 1, len(onset_norm)))
+        return f0, f1
+
+    def stats(start: float, end: float) -> tuple[float, float, float, float]:
+        f0, f1 = frame_span(start, end)
+        onset_avg = float(np.mean(onset_norm[f0:f1])) if f1 > f0 and len(onset_norm) else 0.0
+        onset_peak = float(np.max(onset_norm[f0:f1])) if f1 > f0 and len(onset_norm) else 0.0
+        e0 = min(f0, max(0, len(rms_norm) - 1))
+        e1 = min(f1, len(rms_norm))
+        energy_avg = float(np.mean(rms_norm[e0:e1])) if e1 > e0 and len(rms_norm) else 0.0
+        high_ratio = float(np.mean(highlight_curve[f0:f1] >= highlight_threshold)) if highlight_curve.size and f1 > f0 else 0.0
+        return onset_avg, onset_peak, energy_avg, high_ratio
+
+    def overlaps_interval(start: float, end: float, intervals: list[tuple[float, float]], pad: float = 0.0) -> bool:
+        return any(not (end < a - pad or start > b + pad) for a, b in intervals)
+
+    protected_intervals: list[tuple[float, float]] = []
+    for n in notes:
+        if n.get("type") in {"hold", "roll"}:
+            protected_intervals.append((float(n.get("time", 0.0)), float(n.get("end_time", n.get("time", 0.0)))))
+
+    # 1) Hold notes: longer, readable sustains.  Instead of requiring an empty
+    # lane beforehand, choose a good calm span and remove same-lane taps inside.
+    hold_limits = {"normal": 2, "hard": 3, "extreme": 4, "master": 5}
+    hold_beats = {"normal": 3.0, "hard": 3.0, "extreme": 3.5, "master": 4.0}
+    max_holds = hold_limits.get(difficulty, 3)
+    hold_candidates: list[tuple[float, float, float, int, float, str]] = []
+
+    # Scan every beat so holds appear often enough, but score calm/sustained
+    # spans higher than transient-heavy spans.
+    for bi in range(1, len(beat_times) - 4):
+        start = float(beat_times[bi])
+        if start < 3.0 or start > duration - 5.0:
+            continue
+        dur = beat_interval * hold_beats.get(difficulty, 3.0)
+        dur = float(np.clip(dur, 1.25, 3.40 if difficulty != "master" else 4.20))
+        end = min(duration - 0.45, start + dur)
+        if end - start < 1.15:
+            continue
+        onset_avg, onset_peak, energy_avg, high_ratio = stats(start, end)
+        # Prefer sustained musical sections.  Allow moderate highlight ratio, but
+        # reject very clicky spans; those are better as taps/rolls.
+        if energy_avg < 0.24 or onset_avg > 0.52 or onset_peak > 0.94:
+            continue
+        if overlaps_interval(start, end, protected_intervals, pad=0.80):
+            continue
+        lane = int((seed + bi * 5 + int(energy_avg * 13)) % lanes)
+        local_bpm = _local_bpm_at(start, beat_times, tempo)
+        speed = base_speed * np.clip(0.90 + 0.18 * (local_bpm / max(tempo, 1.0)) + 0.10 * energy_avg, 0.86, 1.22)
+        color = "bright" if energy_avg >= 0.50 else "normal"
+        score = energy_avg * 0.70 + (1.0 - onset_avg) * 0.35 + high_ratio * 0.12
+        hold_candidates.append((score, start, end, lane, speed, color))
+
+    hold_candidates.sort(reverse=True, key=lambda x: x[0])
+    placed_holds = 0
+    for _score, start, end, lane, speed, color in hold_candidates:
+        if placed_holds >= max_holds:
+            break
+        if overlaps_interval(start, end, protected_intervals, pad=1.10):
+            continue
+        # Clear this lane during the sustain. Other lanes may still have notes,
+        # but the held lane must stay readable/playable.
+        notes[:] = [
+            n for n in notes
+            if not (
+                int(n.get("lane", -99)) == lane
+                and start - 0.10 <= float(n.get("time", 0.0)) <= end + 0.14
+            )
+        ]
+        notes.append({
+            "time": round(start, 4),
+            "raw_time": round(start, 4),
+            "end_time": round(end, 4),
+            "duration": round(end - start, 4),
+            "grid_locked": True,
+            "lane": int(lane),
+            "type": "hold",
+            "source": "sustain-hold-v14",
+            "strength": round(float(_score), 4),
+            "energy": round(float(_score), 4),
+            "local_bpm": round(float(_local_bpm_at(start, beat_times, tempo)), 3),
+            "scroll_speed": round(float(speed), 2),
+            "raw_scroll_speed": round(float(speed), 2),
+            "color": color,
+            "salience": round(float(0.82 + _score * 0.20), 4),
+        })
+        protected_intervals.append((start, end))
+        placed_holds += 1
+
+    # 2) Roll notes: visible but still special.  Use local transient density; if
+    # a song has no very obvious bursts, place one or two best fallback rolls on
+    # high-energy spans so the mechanic can be tested.
+    roll_limits = {"normal": 1, "hard": 2, "extreme": 3, "master": 4}
+    max_rolls = roll_limits.get(difficulty, 2)
+    if max_rolls <= 0:
+        return
+
+    roll_candidates: list[tuple[float, float, float, int, float]] = []
+    step = 2 if difficulty in {"extreme", "master"} else 3
+    for bi in range(2, len(beat_times) - 4, step):
+        start = float(beat_times[bi])
+        if start < 6.0 or start > duration - 6.0:
+            continue
+        span_beats = {"normal": 1.0, "hard": 1.25, "extreme": 1.5, "master": 1.75}.get(difficulty, 1.25)
+        end = min(duration - 0.6, start + beat_interval * span_beats)
+        if end - start < 0.55:
+            continue
+        onset_avg, onset_peak, energy_avg, high_ratio = stats(start, end)
+        burst_score = 0.44 * onset_avg + 0.28 * onset_peak + 0.18 * energy_avg + 0.10 * high_ratio
+        threshold = {"normal": 0.34, "hard": 0.30, "extreme": 0.26, "master": 0.23}.get(difficulty, 0.30)
+        if burst_score < threshold:
+            continue
+        if overlaps_interval(start, end, protected_intervals, pad=1.10):
+            continue
+        required = int(np.clip(round((end - start) * {"normal": 4.5, "hard": 5.5, "extreme": 7.0, "master": 8.5}.get(difficulty, 6.0)), 3, 18))
+        speed = base_speed * np.clip(1.03 + 0.12 * energy_avg + 0.08 * high_ratio, 0.96, 1.30)
+        roll_candidates.append((burst_score, start, end, required, speed))
+
+    # Fallback: choose top local-energy windows even if transient threshold is
+    # conservative.  This makes rolls visible in real testing without flooding.
+    if len(roll_candidates) < max(1, max_rolls // 2):
+        fallback: list[tuple[float, float, float, int, float]] = []
+        for bi in range(3, len(beat_times) - 4, 4):
+            start = float(beat_times[bi])
+            if start < 8.0 or start > duration - 8.0:
+                continue
+            end = min(duration - 0.6, start + beat_interval * 1.15)
+            if overlaps_interval(start, end, protected_intervals, pad=1.10):
+                continue
+            onset_avg, onset_peak, energy_avg, high_ratio = stats(start, end)
+            score = 0.36 * onset_avg + 0.24 * onset_peak + 0.28 * energy_avg + 0.12 * high_ratio
+            required = int(np.clip(round((end - start) * {"normal": 4.0, "hard": 5.0, "extreme": 6.5, "master": 8.0}.get(difficulty, 5.0)), 3, 15))
+            speed = base_speed * np.clip(1.00 + 0.10 * energy_avg + 0.06 * high_ratio, 0.94, 1.24)
+            fallback.append((score, start, end, required, speed))
+        fallback.sort(reverse=True, key=lambda x: x[0])
+        roll_candidates.extend(fallback[:max_rolls])
+
+    roll_candidates.sort(reverse=True, key=lambda x: x[0])
+    placed_rolls = 0
+    for score, start, end, required, speed in roll_candidates:
+        if placed_rolls >= max_rolls:
+            break
+        if overlaps_interval(start, end, protected_intervals, pad=1.70):
+            continue
+        # During a roll, the intended action is any-key mashing. Remove regular
+        # notes in every lane across the span.
+        notes[:] = [
+            n for n in notes
+            if not (start - 0.08 <= float(n.get("time", 0.0)) <= end + 0.10)
+        ]
+        notes.append({
+            "time": round(start, 4),
+            "raw_time": round(start, 4),
+            "end_time": round(end, 4),
+            "duration": round(end - start, 4),
+            "grid_locked": True,
+            "lane": -1,
+            "type": "roll",
+            "required_hits": int(required),
+            "source": "burst-roll-v14",
+            "strength": round(float(score), 4),
+            "energy": round(float(score), 4),
+            "local_bpm": round(float(_local_bpm_at(start, beat_times, tempo)), 3),
+            "scroll_speed": round(float(speed), 2),
+            "raw_scroll_speed": round(float(speed), 2),
+            "color": "highlight",
+            "salience": round(float(1.10 + score), 4),
+        })
+        protected_intervals.append((start, end))
+        placed_rolls += 1
+
+
 def _snap_chord_clusters(notes: list[dict[str, Any]], window: float = 0.034) -> None:
     """Force near-simultaneous multi-lane hits to share one exact timestamp.
 
@@ -727,6 +940,23 @@ def analyze_audio(audio_path: str | Path, difficulty: str = "hard", output: str 
         seed=seed,
     )
 
+    _add_hold_and_roll_notes(
+        notes,
+        beat_times=beat_times,
+        grid=grid,
+        onset_norm=onset_norm,
+        rms_norm=rms_norm,
+        highlight_curve=highlight_curve,
+        highlight_threshold=highlight_threshold,
+        sr=sr,
+        hop_length=hop_length,
+        duration=duration,
+        tempo=tempo,
+        cfg=cfg,
+        difficulty=difficulty,
+        seed=seed,
+    )
+
     _snap_chord_clusters(notes, window=0.034 if difficulty in {"normal", "hard"} else 0.042)
     notes = _dedupe_and_limit(notes, lanes, float(cfg["max_notes_per_second"]))
 
@@ -791,7 +1021,7 @@ def analyze_audio(audio_path: str | Path, difficulty: str = "hard", output: str 
     chart_id = f"{_song_id(audio_path)}:{difficulty}:{len(notes)}"
 
     chart = {
-        "version": 8,
+        "version": 14,
         "chart_id": chart_id,
         "song_id": _song_id(audio_path),
         "title": audio_path.stem,
@@ -817,11 +1047,11 @@ def analyze_audio(audio_path: str | Path, difficulty: str = "hard", output: str 
         "note_count": len(notes),
         "generator": {
             "name": "Rhythm4G autocharter",
-            "version": 8,
+            "version": 14,
             "developer": "집돌이 페렐만",
             "tempo_correction": tempo_correction,
-            "timing": "hybrid onset timing with half/double BPM correction, motif patterns, chord clustering, per-grid visual speed markers, and locked chord visuals",
-            "density": "aggressive difficulty presets with accent chords, streams, stairs, trills, and jacks",
+            "timing": "hybrid onset timing with half/double BPM correction, motif patterns, chord clustering, per-grid visual speed markers, locked chord visuals, and anti-mash-aware special notes",
+            "density": "difficulty presets with accent chords, streams, stairs, trills, jacks, long playable sustain holds and visible burst rolls",
         },
         "notes": notes,
     }

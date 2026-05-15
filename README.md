@@ -1,9 +1,17 @@
-# Rhythm4G v8
+# Rhythm4G v14
 
 **Rhythm4G**는 MP3/WAV/OGG/FLAC/M4A 파일을 불러와 자동으로 리듬게임 채보를 만들고, PC 키보드로 플레이할 수 있는 Python 기반 리듬게임 MVP입니다.
 
 - 게임명: Rhythm4G
 - 개발자: 집돌이 페렐만
+
+## v14 변경사항
+
+- 롱노트를 다시 구현했습니다. 이제 head/tail/sustain bar가 위에서 자연스럽게 내려오며, 최소 길이를 늘려 실제로 누르고 유지할 수 있습니다.
+- 롱노트가 배치된 lane 안의 일반 노트는 해당 sustain 구간에서 제거되어 같은 줄 충돌이 생기지 않습니다.
+- 키를 꾹 누른 상태가 유지되면 `KEYDOWN` 반복 이벤트 없이도 롱노트가 active 상태로 유지되고 tail에서 판정됩니다.
+- 연타노트 생성 기준을 완화하고 fallback 후보를 추가해 실제 곡에서 더 자주 확인할 수 있게 했습니다.
+- 런처 UI를 카드형/표형 목록으로 정리하고, 긴 곡명 때문에 가로로 잘리는 문제를 줄였습니다.
 
 ## v8 주요 변경점
 
@@ -13,6 +21,14 @@
 - 회색 grid 속도, lane column 외부 노트 표시 방지, UTF-8/한글 폰트 처리는 v7 수정사항을 유지합니다.
 - BPM 수동 지정과 half/double BPM 보정을 유지합니다.
 - 기존 상대경로/포터블 배포 구조를 유지합니다.
+
+
+## v13 변경사항
+
+- 한 번에 여러 난이도를 선택해서 같은 곡의 채보를 순차 생성할 수 있습니다. 런처의 난이도 선택이 체크박스 방식으로 바뀌었습니다.
+- CLI에서도 `--difficulty normal hard extreme master`처럼 여러 난이도 생성을 지원합니다.
+- v12에서 플레이 시 `'RhythmGame' object has no attribute 'draw_hit_bursts'`가 발생하던 문제를 수정했습니다. 원인은 draw/update 메서드가 잘못 병합되어 렌더링 함수 일부가 `update_misses()` 안으로 들어간 것이었습니다.
+- 롱노트/연타노트 렌더링과 miss 처리 로직을 분리해, 플레이 화면에서 정상적으로 그려지고 기록 저장까지 이어지도록 정리했습니다.
 
 ## 폴더 구조
 
@@ -48,7 +64,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 1. `python run_rhythmforge.py` 실행
 2. `음악 파일 선택`으로 MP3 등을 선택
-3. 난이도 선택
+3. 만들 난이도 하나 이상 선택
 4. 자동 BPM이 틀리는 곡이면 `BPM 수동 지정` 체크 후 BPM 입력
 5. 필요하면 오프셋, 노트 속도, 전역 키 설정 변경
 6. `전역 키 설정 저장` 클릭
@@ -71,6 +87,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 python -m rhythmforge.main auto "music\song.mp3" --difficulty normal
 python -m rhythmforge.main auto "music\song.mp3" --difficulty hard --bpm 185
 python -m rhythmforge.main generate "music\song.mp3" --difficulty master --bpm 185
+python -m rhythmforge.main generate "music\song.mp3" --difficulty normal hard extreme master --bpm 185
 python -m rhythmforge.main play "charts\song.hard.json"
 python -m rhythmforge.main app
 ```
@@ -122,3 +139,10 @@ release\Rhythm4G\
 - 뒤로가기 키도 전역 제어키로 관리합니다. 기본값은 `Escape`입니다.
 - 점수 체계를 1,000,000점 고정 만점으로 변경했습니다. 전부 PERFECT이면 정확히 1,000,000점입니다.
 
+
+## v12 변경사항
+
+- 입력 판정이 `event.key`뿐 아니라 SDL scancode를 우선 사용합니다. 따라서 한글/일본어/중국어 IME가 켜져 있어도 D/F/J/K 같은 물리 키 입력이 인식됩니다.
+- 키 연타로 노트가 자동 처리되는 문제를 줄이기 위해 anti-mash 판정을 추가했습니다. 노트가 가까이 오고 있는데 판정창보다 너무 이르게 누르면 해당 노트가 EARLY/BAD 처리됩니다.
+- 채보에 `hold` 롱노트와 `roll` 연타노트를 추가했습니다. 롱노트는 키를 누르고 유지해야 하며, 연타노트는 표시된 남은 횟수만큼 아무 플레이 키나 빠르게 누르면 됩니다.
+- 런처는 좁은 화면에서 좌우 패널을 세로로 쌓는 반응형 레이아웃을 사용하며, 긴 곡명은 가로 스크롤 가능한 목록으로 확인할 수 있습니다.
